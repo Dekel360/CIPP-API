@@ -32,6 +32,7 @@ function Push-DomainAnalyserTenant {
                 '*.teams.dstny.com'
                 '*.msteams.8x8.com'
                 '*.ucconnect.co.uk'
+                '*.teams-sbc.dk'
             )
             $Domains = New-GraphGetRequest -uri 'https://graph.microsoft.com/beta/domains' -tenantid $Tenant.customerId | Where-Object { $_.isVerified -eq $true } | ForEach-Object {
                 $Domain = $_
@@ -100,6 +101,9 @@ function Push-DomainAnalyserTenant {
                                 $Domain.DkimSelectors = $OldDomain.DkimSelectors
                                 $Domain.MailProviders = $OldDomain.MailProviders
                             }
+                            # Fix tenant info in the event of a default domain name change in a tenant
+                            $Domain | Add-Member -MemberType NoteProperty -Name 'TenantId' -Value $TenantDomain.Tenant -Force
+                            $Domain | Add-Member -MemberType NoteProperty -Name 'TenantGUID' -Value $TenantDomain.TenantGUID -Force
                         }
                         # Return domain object to list
                         $TenantDomainObjects.Add($Domain)
