@@ -18,6 +18,8 @@ function Invoke-CIPPStandardTransportRuleTemplate {
             Medium Impact
         ADDEDDATE
             2023-12-30
+        EXECUTIVETEXT
+            Deploys standardized email flow rules that automatically manage how emails are processed, filtered, and routed within the organization. These templates ensure consistent email security policies, compliance requirements, and business rules are applied across all email communications.
         ADDEDCOMPONENT
             {"type":"autoComplete","name":"transportRuleTemplate","label":"Select Transport Rule Template","api":{"url":"/api/ListTransportRulesTemplates","labelField":"name","valueField":"GUID","queryKey":"ListTransportRulesTemplates"}}
         UPDATECOMMENTBLOCK
@@ -47,9 +49,13 @@ function Invoke-CIPPStandardTransportRuleTemplate {
             try {
                 if ($Existing) {
                     Write-Host 'Found existing'
-                    $RequestParams | Add-Member -NotePropertyValue $RequestParams.name -NotePropertyName Identity
-                    $GraphRequest = New-ExoRequest -tenantid $Tenant -cmdlet 'Set-TransportRule' -cmdParams ($RequestParams | Select-Object -Property * -ExcludeProperty GUID, Comments, HasSenderOverride, ExceptIfHasSenderOverride, ExceptIfMessageContainsDataClassifications, MessageContainsDataClassifications, UseLegacyRegex) -useSystemMailbox $true
-                    Write-LogMessage -API 'Standards' -tenant $tenant -message "Successfully set transport rule for $tenant" -sev 'Info'
+                    if ($Settings.overwrite) {
+                        $RequestParams | Add-Member -NotePropertyValue $RequestParams.name -NotePropertyName Identity
+                        $GraphRequest = New-ExoRequest -tenantid $Tenant -cmdlet 'Set-TransportRule' -cmdParams ($RequestParams | Select-Object -Property * -ExcludeProperty GUID, Comments, HasSenderOverride, ExceptIfHasSenderOverride, ExceptIfMessageContainsDataClassifications, MessageContainsDataClassifications, UseLegacyRegex) -useSystemMailbox $true
+                        Write-LogMessage -API 'Standards' -tenant $tenant -message "Successfully set transport rule for $tenant" -sev 'Info'
+                    } else {
+                        Write-LogMessage -API 'Standards' -tenant $tenant -message "Skipping transport rule for $tenant as it already exists" -sev 'Info'
+                    }
                 } else {
                     Write-Host 'Creating new'
                     $GraphRequest = New-ExoRequest -tenantid $Tenant -cmdlet 'New-TransportRule' -cmdParams ($RequestParams | Select-Object -Property * -ExcludeProperty GUID, Comments, HasSenderOverride, ExceptIfHasSenderOverride, ExceptIfMessageContainsDataClassifications, MessageContainsDataClassifications, UseLegacyRegex) -useSystemMailbox $true
