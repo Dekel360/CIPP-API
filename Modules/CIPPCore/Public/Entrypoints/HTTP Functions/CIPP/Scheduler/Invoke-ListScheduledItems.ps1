@@ -1,5 +1,3 @@
-using namespace System.Net
-
 function Invoke-ListScheduledItems {
     <#
     .FUNCTIONALITY
@@ -9,11 +7,6 @@ function Invoke-ListScheduledItems {
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
-
-    $APIName = $Request.Params.CIPPEndpoint
-    $Headers = $Request.Headers
-    Write-LogMessage -headers $Headers -API $APIName -message 'Accessed this API' -Sev 'Debug'
-
     $ScheduledItemFilter = [System.Collections.Generic.List[string]]::new()
     $ScheduledItemFilter.Add("PartitionKey eq 'ScheduledTask'")
 
@@ -26,11 +19,12 @@ function Invoke-ListScheduledItems {
         $ShowHidden = $Request.Query.ShowHidden ?? $Request.Body.ShowHidden
         $Name = $Request.Query.Name ?? $Request.Body.Name
         $Type = $Request.Query.Type ?? $Request.Body.Type
+        $SearchTitle = $Request.query.SearchTitle ?? $Request.body.SearchTitle
 
         if ($ShowHidden -eq $true) {
-            $ScheduledItemFilter.Add('Hidden eq true')
+            $ScheduledItemFilter.Add("(Hidden eq true or Hidden eq 'True')")
         } else {
-            $ScheduledItemFilter.Add('Hidden eq false')
+            $ScheduledItemFilter.Add("(Hidden eq false or Hidden eq 'False')")
         }
 
         if ($Name) {
@@ -49,8 +43,13 @@ function Invoke-ListScheduledItems {
         $HiddenTasks = $true
     }
     $Tasks = Get-CIPPAzDataTableEntity @Table -Filter $Filter
+    Write-Information "Retrieved $($Tasks.Count) scheduled tasks from storage."
     if ($Type) {
         $Tasks = $Tasks | Where-Object { $_.command -eq $Type }
+    }
+
+    if ($SearchTitle) {
+        $Tasks = $Tasks | Where-Object { $_.Name -like $SearchTitle }
     }
 
     $AllowedTenants = Test-CIPPAccess -Request $Request -TenantList
@@ -60,8 +59,12 @@ function Invoke-ListScheduledItems {
         $AllowedTenantDomains = $TenantList | Where-Object -Property customerId -In $AllowedTenants | Select-Object -ExpandProperty defaultDomainName
         $Tasks = $Tasks | Where-Object -Property Tenant -In $AllowedTenantDomains
     }
-    $ScheduledTasks = foreach ($Task in $tasks) {
+
+    Write-Information "Found $($Tasks.Count) scheduled tasks after filtering and access check."
+
+    $ScheduledTasks = foreach ($Task in $Tasks) {
         if (!$Task.Tenant -or !$Task.Command) {
+            Write-Information "Skipping invalid scheduled task entry: $($Task.RowKey)"
             continue
         }
 
@@ -108,12 +111,22 @@ function Invoke-ListScheduledItems {
                 type  = 'Tenant'
             }
         }
+        if ($Task.Trigger) {
+            try {
+                $TriggerObject = $Task.Trigger | ConvertFrom-Json -ErrorAction SilentlyContinue
+                if ($TriggerObject) {
+                    $Task | Add-Member -NotePropertyName Trigger -NotePropertyValue $TriggerObject -Force
+                }
+            } catch {
+                Write-Warning "Failed to parse trigger information for task $($Task.RowKey): $($_.Exception.Message)"
+                # Fall back to keeping original trigger value
+            }
+        }
 
         $Task
     }
 
-    # Associate values to output bindings by calling 'Push-OutputBinding'.
-    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+    return ([HttpResponseContext]@{
             StatusCode = [HttpStatusCode]::OK
             Body       = @($ScheduledTasks | Sort-Object -Property ScheduledTime, ExecutedTime -Descending)
         })
