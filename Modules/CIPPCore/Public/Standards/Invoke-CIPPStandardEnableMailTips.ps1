@@ -13,8 +13,10 @@ function Invoke-CIPPStandardEnableMailTips {
         CAT
             Exchange Standards
         TAG
-            "CIS"
+            "CIS M365 5.0 (6.5.2)"
             "exo_mailtipsenabled"
+        EXECUTIVETEXT
+            Enables helpful notifications in Outlook that warn users about potential email issues, such as sending to large groups, external recipients, or invalid addresses. This reduces email mistakes and improves communication efficiency by providing real-time guidance to employees.
         ADDEDCOMPONENT
             {"type":"number","name":"standards.EnableMailTips.MailTipsLargeAudienceThreshold","label":"Number of recipients to trigger the large audience MailTip (Default is 25)","placeholder":"Enter a profile name","defaultValue":25}
         IMPACT
@@ -39,12 +41,10 @@ function Invoke-CIPPStandardEnableMailTips {
         Write-Host "We're exiting as the correct license is not present for this standard."
         return $true
     } #we're done.
-    ##$Rerun -Type Standard -Tenant $Tenant -Settings $Settings 'EnableMailTips'
 
     try {
         $MailTipsState = New-ExoRequest -tenantid $Tenant -cmdlet 'Get-OrganizationConfig' | Select-Object MailTipsAllTipsEnabled, MailTipsExternalRecipientsTipsEnabled, MailTipsGroupMetricsEnabled, MailTipsLargeAudienceThreshold
-    }
-    catch {
+    } catch {
         $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
         Write-LogMessage -API 'Standards' -Tenant $Tenant -Message "Could not get the EnableMailTips state for $Tenant. Error: $ErrorMessage" -Sev Error
         return
@@ -77,8 +77,15 @@ function Invoke-CIPPStandardEnableMailTips {
     }
 
     if ($Settings.report -eq $true) {
-        $state = $StateIsCorrect ? $true : $MailTipsState
-        Set-CIPPStandardsCompareField -FieldName 'standards.EnableMailTips' -FieldValue $State -Tenant $tenant
+        $CurrentValue = $MailTipsState
+        $ExpectedValue = [PSCustomObject]@{
+            MailTipsAllTipsEnabled                = $true
+            MailTipsExternalRecipientsTipsEnabled = $true
+            MailTipsGroupMetricsEnabled           = $true
+            MailTipsLargeAudienceThreshold        = $Settings.MailTipsLargeAudienceThreshold
+        }
+
+        Set-CIPPStandardsCompareField -FieldName 'standards.EnableMailTips' -CurrentValue $CurrentValue -ExpectedValue $ExpectedValue -Tenant $tenant
         Add-CIPPBPAField -FieldName 'MailTipsEnabled' -FieldValue $StateIsCorrect -StoreAs bool -Tenant $tenant
     }
 

@@ -13,6 +13,8 @@ function Invoke-CIPPStandardTeamsFederationConfiguration {
         CAT
             Teams Standards
         TAG
+        EXECUTIVETEXT
+            Configures how the organization federates with external organizations for Teams communication, controlling whether employees can communicate with specific external domains or all external organizations. This setting enables secure inter-organizational collaboration while maintaining control over external communications.
         ADDEDCOMPONENT
             {"type":"switch","name":"standards.TeamsFederationConfiguration.AllowTeamsConsumer","label":"Allow users to communicate with other organizations"}
             {"type":"autoComplete","required":true,"multiple":false,"creatable":false,"name":"standards.TeamsFederationConfiguration.DomainControl","label":"Communication Mode","options":[{"label":"Allow all external domains","value":"AllowAllExternal"},{"label":"Block all external domains","value":"BlockAllExternal"},{"label":"Allow specific external domains","value":"AllowSpecificExternal"},{"label":"Block specific external domains","value":"BlockSpecificExternal"}]}
@@ -32,7 +34,6 @@ function Invoke-CIPPStandardTeamsFederationConfiguration {
 
     param($Tenant, $Settings)
     $TestResult = Test-CIPPStandardLicense -StandardName 'TeamsFederationConfiguration' -TenantFilter $Tenant -RequiredCapabilities @('MCOSTANDARD', 'MCOEV', 'MCOIMP', 'TEAMS1','Teams_Room_Standard')
-    ##$Rerun -Type Standard -Tenant $Tenant -Settings $Settings 'TeamsFederationConfiguration'
 
     if ($TestResult -eq $false) {
         Write-Host "We're exiting as the correct license is not present for this standard."
@@ -142,11 +143,19 @@ function Invoke-CIPPStandardTeamsFederationConfiguration {
 
     if ($Settings.report -eq $true) {
         Add-CIPPBPAField -FieldName 'FederationConfiguration' -FieldValue $StateIsCorrect -StoreAs bool -Tenant $Tenant
-        if ($StateIsCorrect -eq $true) {
-            $FieldValue = $true
-        } else {
-            $FieldValue = $CurrentState | Select-Object AllowTeamsConsumer, AllowFederatedUsers, AllowedDomains, BlockedDomains
+
+        $CurrentValue = @{
+            AllowTeamsConsumer  = $CurrentState.AllowTeamsConsumer
+            AllowFederatedUsers = $CurrentState.AllowFederatedUsers
+            AllowedDomains      = if ($CurrentAllowedDomains.GetType().Name -eq 'Deserialized.Microsoft.Rtc.Management.WritableConfig.Settings.Edge.AllowAllKnownDomains') { $CurrentAllowedDomains.ToString() } else { $CurrentAllowedDomains }
+            BlockedDomains      = $CurrentState.BlockedDomains
         }
-        Set-CIPPStandardsCompareField -FieldName 'standards.TeamsFederationConfiguration' -FieldValue $FieldValue -Tenant $Tenant
+        $ExpectedValue = @{
+            AllowTeamsConsumer  = $Settings.AllowTeamsConsumer
+            AllowFederatedUsers = $AllowFederatedUsers
+            AllowedDomains      = $AllowedDomains
+            BlockedDomains      = $BlockedDomains
+        }
+        Set-CIPPStandardsCompareField -FieldName 'standards.TeamsFederationConfiguration' -CurrentValue $CurrentValue -ExpectedValue $ExpectedValue -Tenant $Tenant
     }
 }

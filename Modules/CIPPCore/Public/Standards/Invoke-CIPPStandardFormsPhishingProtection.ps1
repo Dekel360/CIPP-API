@@ -13,9 +13,11 @@ function Invoke-CIPPStandardFormsPhishingProtection {
         CAT
             Global Standards
         TAG
-            "CIS"
+            "CIS M365 5.0 (1.3.5)"
             "Security"
             "PhishingProtection"
+        EXECUTIVETEXT
+            Automatically scans Microsoft Forms created by employees for malicious content and phishing attempts, preventing the creation and distribution of harmful forms within the organization. This protects against both internal threats and compromised accounts that might be used to distribute malicious content.
         ADDEDCOMPONENT
         IMPACT
             Low Impact
@@ -42,7 +44,7 @@ function Invoke-CIPPStandardFormsPhishingProtection {
     } catch {
         $ErrorMessage = Get-CippException -Exception $_
         Write-LogMessage -API 'Standards' -tenant $Tenant -message "Could not get current Forms settings. Error: $($ErrorMessage.NormalizedError)" -sev Error -LogData $ErrorMessage
-        Return
+        return
     }
 
     if ($Settings.remediate -eq $true) {
@@ -80,7 +82,14 @@ function Invoke-CIPPStandardFormsPhishingProtection {
     }
 
     if ($Settings.report -eq $true) {
-        Set-CIPPStandardsCompareField -FieldName 'standards.FormsPhishingProtection' -FieldValue $CurrentState -Tenant $Tenant
+        $CurrentValue = @{
+            isInOrgFormsPhishingScanEnabled = $CurrentState
+        }
+        $ExpectedValue = @{
+            isInOrgFormsPhishingScanEnabled = $true
+        }
+
+        Set-CIPPStandardsCompareField -FieldName 'standards.FormsPhishingProtection' -CurrentValue $CurrentValue -ExpectedValue $ExpectedValue -TenantFilter $Tenant
         Add-CIPPBPAField -FieldName 'FormsPhishingProtection' -FieldValue $CurrentState -StoreAs bool -Tenant $Tenant
     }
 }

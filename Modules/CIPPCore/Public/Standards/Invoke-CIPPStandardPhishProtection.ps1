@@ -13,6 +13,8 @@ function Invoke-CIPPStandardPhishProtection {
         CAT
             Global Standards
         TAG
+        EXECUTIVETEXT
+            Implements advanced phishing protection by adding visual indicators to login pages that help users identify legitimate Microsoft login pages versus fraudulent copies. This security measure protects against sophisticated phishing attacks that attempt to steal employee credentials.
         ADDEDCOMPONENT
         IMPACT
             Low Impact
@@ -31,7 +33,6 @@ function Invoke-CIPPStandardPhishProtection {
     #>
 
     param($Tenant, $Settings)
-    ##$Rerun -Type Standard -Tenant $Tenant -Settings $Settings 'PhishProtection'
 
     $TenantId = Get-Tenants | Where-Object -Property defaultDomainName -EQ $tenant
 
@@ -98,7 +99,13 @@ function Invoke-CIPPStandardPhishProtection {
     }
     if ($Settings.report -eq $true) {
         if ($currentBody -like "*$CSS*") { $authState = $true } else { $authState = $false }
+        $CurrentValue = @{
+            PhishingCSSEnabled = $authState
+        }
+        $ExpectedValue = @{
+            PhishingCSSEnabled = $true
+        }
         Add-CIPPBPAField -FieldName 'PhishProtection' -FieldValue $authState -StoreAs bool -Tenant $tenant
-        Set-CIPPStandardsCompareField -FieldName 'standards.PhishProtection' -FieldValue $authState -Tenant $tenant
+        Set-CIPPStandardsCompareField -FieldName 'standards.PhishProtection' -CurrentValue $CurrentValue -ExpectedValue $ExpectedValue -Tenant $tenant
     }
 }

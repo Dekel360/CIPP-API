@@ -13,7 +13,6 @@ function Invoke-CIPPStandardAntiPhishPolicy {
         CAT
             Defender Standards
         TAG
-            "CIS"
             "mdo_safeattachments"
             "mdo_highconfidencespamaction"
             "mdo_highconfidencephishaction"
@@ -21,7 +20,10 @@ function Invoke-CIPPStandardAntiPhishPolicy {
             "mdo_spam_notifications_only_for_admins"
             "mdo_antiphishingpolicies"
             "mdo_phishthresholdlevel"
+            "CIS M365 5.0 (2.1.7)"
+            "NIST CSF 2.0 (DE.CM-09)"
         ADDEDCOMPONENT
+            {"type":"textField","name":"standards.AntiPhishPolicy.name","label":"Policy Name","required":true,"defaultValue":"CIPP Default Anti-Phishing Policy"}
             {"type":"number","label":"Phishing email threshold. (Default 1)","name":"standards.AntiPhishPolicy.PhishThresholdLevel","defaultValue":1}
             {"type":"switch","label":"Show first contact safety tip","name":"standards.AntiPhishPolicy.EnableFirstContactSafetyTips","defaultValue":true}
             {"type":"switch","label":"Show user impersonation safety tip","name":"standards.AntiPhishPolicy.EnableSimilarUsersSafetyTips","defaultValue":true}
@@ -63,18 +65,26 @@ function Invoke-CIPPStandardAntiPhishPolicy {
     $MDOLicensed = $ServicePlans -contains "ATP_ENTERPRISE"
     Write-Information "MDOLicensed: $MDOLicensed"
 
-    $PolicyList = @('CIPP Default Anti-Phishing Policy','Default Anti-Phishing Policy')
-    $ExistingPolicy = New-ExoRequest -tenantid $Tenant -cmdlet 'Get-AntiPhishPolicy' | Where-Object -Property Name -In $PolicyList
+    # Use custom name if provided, otherwise use default for backward compatibility
+    $PolicyName = if ($Settings.name) { $Settings.name } else { 'CIPP Default Anti-Phishing Policy' }
+    $PolicyList = @($PolicyName, 'CIPP Default Anti-Phishing Policy','Default Anti-Phishing Policy')
+    $ExistingPolicy = New-ExoRequest -tenantid $Tenant -cmdlet 'Get-AntiPhishPolicy' | Where-Object -Property Name -In $PolicyList | Select-Object -First 1
     if ($null -eq $ExistingPolicy.Name) {
-        $PolicyName = $PolicyList[0]
+        # No existing policy - use the configured/default name
+        $PolicyName = if ($Settings.name) { $Settings.name } else { 'CIPP Default Anti-Phishing Policy' }
     } else {
+        # Use existing policy name if found
         $PolicyName = $ExistingPolicy.Name
     }
-    $RuleList = @( 'CIPP Default Anti-Phishing Rule','CIPP Default Anti-Phishing Policy')
-    $ExistingRule = New-ExoRequest -tenantid $Tenant -cmdlet 'Get-AntiPhishRule' | Where-Object -Property Name -In $RuleList
+    # Derive rule name from policy name, but check for old names for backward compatibility
+    $DesiredRuleName = "$PolicyName Rule"
+    $RuleList = @($DesiredRuleName, 'CIPP Default Anti-Phishing Rule','CIPP Default Anti-Phishing Policy')
+    $ExistingRule = New-ExoRequest -tenantid $Tenant -cmdlet 'Get-AntiPhishRule' | Where-Object -Property Name -In $RuleList | Select-Object -First 1
     if ($null -eq $ExistingRule.Name) {
-        $RuleName = $RuleList[0]
+        # No existing rule - use the derived name
+        $RuleName = $DesiredRuleName
     } else {
+        # Use existing rule name if found
         $RuleName = $ExistingRule.Name
     }
 
@@ -105,6 +115,33 @@ function Invoke-CIPPStandardAntiPhishPolicy {
                           ($CurrentState.EnableTargetedDomainsProtection -eq $true) -and
                           ($CurrentState.EnableTargetedUserProtection -eq $true) -and
                           ($CurrentState.EnableOrganizationDomainsProtection -eq $true)
+
+        $CurrentValue = $CurrentState | Select-Object Name, Enabled, PhishThresholdLevel, EnableMailboxIntelligence, EnableMailboxIntelligenceProtection, EnableSpoofIntelligence, EnableFirstContactSafetyTips, EnableSimilarUsersSafetyTips, EnableSimilarDomainsSafetyTips, EnableUnusualCharactersSafetyTips, EnableUnauthenticatedSender, EnableViaTag, AuthenticationFailAction, SpoofQuarantineTag, MailboxIntelligenceProtectionAction, MailboxIntelligenceQuarantineTag, TargetedUserProtectionAction, TargetedUserQuarantineTag, TargetedDomainProtectionAction, TargetedDomainQuarantineTag, EnableOrganizationDomainsProtection, EnableTargetedDomainsProtection, EnableTargetedUserProtection
+        $ExpectedValue = [PSCustomObject]@{
+            Name                                 = $PolicyName
+            Enabled                              = $true
+            PhishThresholdLevel                  = $Settings.PhishThresholdLevel
+            EnableMailboxIntelligence            = $true
+            EnableMailboxIntelligenceProtection  = $true
+            EnableSpoofIntelligence              = $true
+            EnableFirstContactSafetyTips         = $Settings.EnableFirstContactSafetyTips
+            EnableSimilarUsersSafetyTips         = $Settings.EnableSimilarUsersSafetyTips
+            EnableSimilarDomainsSafetyTips       = $Settings.EnableSimilarDomainsSafetyTips
+            EnableUnusualCharactersSafetyTips    = $Settings.EnableUnusualCharactersSafetyTips
+            EnableUnauthenticatedSender          = $true
+            EnableViaTag                         = $true
+            AuthenticationFailAction             = $Settings.AuthenticationFailAction
+            SpoofQuarantineTag                   = $Settings.SpoofQuarantineTag
+            MailboxIntelligenceProtectionAction  = $Settings.MailboxIntelligenceProtectionAction
+            MailboxIntelligenceQuarantineTag     = $Settings.MailboxIntelligenceQuarantineTag
+            TargetedUserProtectionAction         = $Settings.TargetedUserProtectionAction
+            TargetedUserQuarantineTag            = $Settings.TargetedUserQuarantineTag
+            TargetedDomainProtectionAction       = $Settings.TargetedDomainProtectionAction
+            TargetedDomainQuarantineTag          = $Settings.TargetedDomainQuarantineTag
+            EnableTargetedDomainsProtection      = $true
+            EnableTargetedUserProtection         = $true
+            EnableOrganizationDomainsProtection  = $true
+        }
     } else {
         $StateIsCorrect = ($CurrentState.Name -eq $PolicyName) -and
                           ($CurrentState.Enabled -eq $true) -and
@@ -114,6 +151,17 @@ function Invoke-CIPPStandardAntiPhishPolicy {
                           ($CurrentState.EnableViaTag -eq $true) -and
                           ($CurrentState.AuthenticationFailAction -eq $Settings.AuthenticationFailAction) -and
                           ($CurrentState.SpoofQuarantineTag -eq $Settings.SpoofQuarantineTag)
+        $CurrentValue = $CurrentState | Select-Object Name, Enabled, EnableSpoofIntelligence, EnableFirstContactSafetyTips, EnableUnauthenticatedSender, EnableViaTag, AuthenticationFailAction, SpoofQuarantineTag
+        $ExpectedValue = [PSCustomObject]@{
+            Name                        = $PolicyName
+            Enabled                     = $true
+            EnableSpoofIntelligence     = $true
+            EnableFirstContactSafetyTips= $Settings.EnableFirstContactSafetyTips
+            EnableUnauthenticatedSender = $true
+            EnableViaTag                = $true
+            AuthenticationFailAction    = $Settings.AuthenticationFailAction
+            SpoofQuarantineTag          = $Settings.SpoofQuarantineTag
+        }
     }
 
     $AcceptedDomains = New-ExoRequest -tenantid $Tenant -cmdlet 'Get-AcceptedDomain'

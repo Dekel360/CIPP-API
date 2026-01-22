@@ -13,8 +13,10 @@ function Invoke-CIPPStandardDisableExternalCalendarSharing {
         CAT
             Exchange Standards
         TAG
-            "CIS"
+            "CIS M365 5.0 (1.3.3)"
             "exo_individualsharing"
+        EXECUTIVETEXT
+            Prevents employees from sharing their calendars with external parties, protecting sensitive meeting information and internal schedules from unauthorized access. This security measure helps maintain confidentiality of business activities while still allowing internal collaboration.
         ADDEDCOMPONENT
         IMPACT
             Low Impact
@@ -37,13 +39,11 @@ function Invoke-CIPPStandardDisableExternalCalendarSharing {
         Write-Host "We're exiting as the correct license is not present for this standard."
         return $true
     } #we're done.
-    ##$Rerun -Type Standard -Tenant $Tenant -Settings $Settings 'DisableExternalCalendarSharing'
 
     try {
         $CurrentInfo = New-ExoRequest -tenantid $Tenant -cmdlet 'Get-SharingPolicy' |
-        Where-Object { $_.Default -eq $true }
-    }
-    catch {
+            Where-Object { $_.Default -eq $true }
+    } catch {
         $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
         Write-LogMessage -API 'Standards' -Tenant $Tenant -Message "Could not get the DisableExternalCalendarSharing state for $Tenant. Error: $ErrorMessage" -Sev Error
         return
@@ -77,8 +77,16 @@ function Invoke-CIPPStandardDisableExternalCalendarSharing {
     }
 
     if ($Settings.report -eq $true) {
-        $CurrentInfo.Enabled = -not $CurrentInfo.Enabled
-        Set-CIPPStandardsCompareField -FieldName 'standards.DisableExternalCalendarSharing' -FieldValue $CurrentInfo.Enabled -TenantFilter $Tenant
-        Add-CIPPBPAField -FieldName 'ExternalCalendarSharingDisabled' -FieldValue $CurrentInfo.Enabled -StoreAs bool -Tenant $tenant
+        $CurrentStatus = -not $CurrentInfo.Enabled
+
+        $CurrentValue = [PSCustomObject]@{
+            ExternalCalendarSharingDisabled = $CurrentStatus
+        }
+        $ExpectedValue = [PSCustomObject]@{
+            ExternalCalendarSharingDisabled = $true
+        }
+
+        Set-CIPPStandardsCompareField -FieldName 'standards.DisableExternalCalendarSharing' -CurrentValue $CurrentValue -ExpectedValue $ExpectedValue -TenantFilter $Tenant
+        Add-CIPPBPAField -FieldName 'ExternalCalendarSharingDisabled' -FieldValue $CurrentStatus -StoreAs bool -Tenant $tenant
     }
 }

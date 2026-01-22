@@ -13,6 +13,8 @@ function Invoke-CIPPStandardSafeSendersDisable {
         CAT
             Exchange Standards
         TAG
+        EXECUTIVETEXT
+            Removes user-defined safe sender lists to prevent security bypasses where malicious emails could avoid spam filtering. This ensures all emails go through proper security screening, even if users have previously marked senders as 'safe', improving overall email security.
         ADDEDCOMPONENT
         DISABLEDFEATURES
             {"report":true,"warn":true,"remediate":false}
@@ -70,7 +72,13 @@ function Invoke-CIPPStandardSafeSendersDisable {
 
     if ($Settings.report -eq $true) {
         #This script always returns true, as it only disables the Safe Senders list
-        Set-CIPPStandardsCompareField -FieldName 'standards.SafeSendersDisable' -FieldValue $true -Tenant $Tenant
+        $CurrentValue = @{
+            SafeSendersDisabled = $true
+        }
+        $ExpectedValue = @{
+            SafeSendersDisabled = $true
+        }
+        Set-CIPPStandardsCompareField -FieldName 'standards.SafeSendersDisable' -CurrentValue $CurrentValue -ExpectedValue $ExpectedValue -Tenant $Tenant
     }
 
 }

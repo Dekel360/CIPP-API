@@ -13,6 +13,8 @@ function Invoke-CIPPStandardProfilePhotos {
         CAT
             Global Standards
         TAG
+        EXECUTIVETEXT
+            Manages user profile photo permissions within Microsoft 365, allowing organizations to control whether employees can upload their own photos or require administrative approval. This helps maintain professional appearance standards and prevents inappropriate images in corporate directories.
         ADDEDCOMPONENT
             {"type":"autoComplete","multiple":false,"creatable":false,"label":"Select value","name":"standards.ProfilePhotos.state","options":[{"label":"Enabled","value":"enabled"},{"label":"Disabled","value":"disabled"}]}
         IMPACT
@@ -42,7 +44,7 @@ function Invoke-CIPPStandardProfilePhotos {
     # Input validation
     if ([string]::IsNullOrWhiteSpace($StateValue)) {
         Write-LogMessage -API 'Standards' -tenant $tenant -message 'ProfilePhotos: Invalid state parameter set' -sev Error
-        Return
+        return
     }
 
     # true if wanted state is enabled, false if disabled
@@ -52,8 +54,7 @@ function Invoke-CIPPStandardProfilePhotos {
     try {
         $Uri = 'https://graph.microsoft.com/beta/admin/people/photoUpdateSettings'
         $CurrentGraphState = New-GraphGetRequest -uri $Uri -tenantid $Tenant
-    }
-    catch {
+    } catch {
         $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
         Write-LogMessage -API 'Standards' -Tenant $Tenant -Message "Could not get the ProfilePhotos state for $Tenant. Error: $ErrorMessage" -Sev Error
         return
@@ -131,6 +132,12 @@ function Invoke-CIPPStandardProfilePhotos {
                 GraphStateCorrect = $GraphStateCorrect
             }
         }
-        Set-CIPPStandardsCompareField -FieldName 'standards.ProfilePhotos' -FieldValue $FieldValue -Tenant $Tenant
+        $CurrentValue = @{
+            ProfilePhotosEnabled = $UsersCanChangePhotos
+        }
+        $ExpectedValue = @{
+            ProfilePhotosEnabled = $DesiredState
+        }
+        Set-CIPPStandardsCompareField -FieldName 'standards.ProfilePhotos' -CurrentValue $CurrentValue -ExpectedValue $ExpectedValue -Tenant $Tenant
     }
 }

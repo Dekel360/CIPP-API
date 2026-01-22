@@ -13,6 +13,8 @@ function Invoke-CIPPStandardEXODirectSend {
         CAT
             Exchange Standards
         TAG
+        EXECUTIVETEXT
+            Controls whether business applications and devices (like printers or scanners) can send emails through the company's email system without authentication. While this enables convenient features like scan-to-email, it may pose security risks and should be carefully managed.
         ADDEDCOMPONENT
             {"type":"autoComplete","multiple":false,"creatable":false,"label":"Select value","name":"standards.EXODirectSend.state","options":[{"label":"Enabled","value":"enabled"},{"label":"Disabled","value":"disabled"}]}
         IMPACT
@@ -30,13 +32,12 @@ function Invoke-CIPPStandardEXODirectSend {
 
     param ($Tenant, $Settings)
 
-
     # Determine desired state. These double negative MS loves are a bit confusing
     $DesiredStateName = $Settings.state.value ?? $Settings.state
     # Input validation
     if ([string]::IsNullOrWhiteSpace($DesiredStateName) -or $DesiredStateName -eq 'Select a value') {
         Write-LogMessage -API 'Standards' -tenant $Tenant -message 'EXODirectSend: Invalid state parameter set' -sev Error
-        Return
+        return
     }
 
     # Get current organization config
@@ -83,8 +84,13 @@ function Invoke-CIPPStandardEXODirectSend {
 
     # Report if needed
     if ($Settings.report -eq $true) {
-
-        Set-CIPPStandardsCompareField -FieldName 'standards.EXODirectSend' -FieldValue $StateIsCorrect -Tenant $Tenant
+        $ExpectedState = @{
+            RejectDirectSend = $DesiredState
+        }
+        $CurrentState = @{
+            RejectDirectSend = $CurrentConfig
+        }
+        Set-CIPPStandardsCompareField -FieldName 'standards.EXODirectSend' -CurrentValue $CurrentState -ExpectedValue $ExpectedState -Tenant $Tenant
         Add-CIPPBPAField -FieldName 'EXODirectSend' -FieldValue $StateIsCorrect -StoreAs bool -Tenant $Tenant
     }
 }

@@ -13,6 +13,11 @@ function Invoke-CIPPStandardAuthMethodsSettings {
         CAT
             Entra (AAD) Standards
         TAG
+            "EIDSCA.AG01"
+            "EIDSCA.AG02"
+            "EIDSCA.AG03"
+        EXECUTIVETEXT
+            Configures security settings that allow users to report suspicious login attempts and manages how the system handles authentication credentials. This enhances overall security by enabling early detection of potential security threats and optimizing authentication processes.
         ADDEDCOMPONENT
             {"type":"autoComplete","multiple":false,"creatable":false,"required":false,"name":"standards.AuthMethodsSettings.ReportSuspiciousActivity","label":"Report Suspicious Activity Settings","options":[{"label":"Microsoft managed","value":"default"},{"label":"Enabled","value":"enabled"},{"label":"Disabled","value":"disabled"}]}
             {"type":"autoComplete","multiple":false,"creatable":false,"required":false,"name":"standards.AuthMethodsSettings.SystemCredential","label":"System Credential Preferences","options":[{"label":"Microsoft managed","value":"default"},{"label":"Enabled","value":"enabled"},{"label":"Disabled","value":"disabled"}]}
@@ -31,7 +36,6 @@ function Invoke-CIPPStandardAuthMethodsSettings {
 
     param($Tenant, $Settings)
 
-    Write-Host 'Time to run'
     # Get current authentication methods policy
     try {
         $CurrentPolicy = New-GraphGetRequest -Uri 'https://graph.microsoft.com/beta/policies/authenticationMethodsPolicy' -tenantid $Tenant -AsApp $true
@@ -56,7 +60,14 @@ function Invoke-CIPPStandardAuthMethodsSettings {
         return
     }
 
-
+    $CurrentValue = [PSCustomObject]@{
+        reportSuspiciousActivitySettings = $CurrentPolicy.reportSuspiciousActivitySettings.state
+        systemCredentialPreferences      = $CurrentPolicy.systemCredentialPreferences.state
+    }
+    $ExpectedValue = [PSCustomObject]@{
+        reportSuspiciousActivitySettings = $ReportSuspiciousActivityState
+        systemCredentialPreferences      = $SystemCredentialState
+    }
 
     # Check if states are set correctly
     $ReportSuspiciousActivityCorrect = if ($CurrentPolicy.reportSuspiciousActivitySettings.state -eq $ReportSuspiciousActivityState) { $true } else { $false }
@@ -88,8 +99,7 @@ function Invoke-CIPPStandardAuthMethodsSettings {
     }
 
     if ($Settings.report -eq $true) {
-        $state = $StateSetCorrectly ? $true :  @{CurrentReportState = $CurrentReportState; CurrentSystemState = $CurrentSystemState; WantedReportState = $ReportSuspiciousActivityState; WantedSystemState = $SystemCredentialState }
-        Set-CIPPStandardsCompareField -FieldName 'standards.AuthMethodsSettings' -FieldValue $state -TenantFilter $tenant
+        Set-CIPPStandardsCompareField -FieldName 'standards.AuthMethodsSettings' -CurrentValue $CurrentValue -ExpectedValue $ExpectedValue -TenantFilter $tenant
         Add-CIPPBPAField -FieldName 'ReportSuspiciousActivity' -FieldValue $CurrentPolicy.reportSuspiciousActivitySettings.state -StoreAs string -Tenant $tenant
         Add-CIPPBPAField -FieldName 'SystemCredential' -FieldValue $CurrentPolicy.systemCredentialPreferences.state -StoreAs string -Tenant $tenant
     }

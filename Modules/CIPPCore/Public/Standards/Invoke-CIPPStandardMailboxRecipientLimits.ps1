@@ -13,6 +13,8 @@ function Invoke-CIPPStandardMailboxRecipientLimits {
         CAT
             Exchange Standards
         TAG
+        EXECUTIVETEXT
+            Controls how many recipients employees can include in a single email, helping prevent spam distribution and managing email server load. This security measure protects against both accidental mass mailings and potential abuse while ensuring legitimate business communications can still reach necessary recipients.
         ADDEDCOMPONENT
             {"type":"number","name":"standards.MailboxRecipientLimits.RecipientLimit","label":"Recipient Limit","defaultValue":500}
         IMPACT
@@ -46,8 +48,7 @@ function Invoke-CIPPStandardMailboxRecipientLimits {
     # Get mailbox plans first
     try {
         $MailboxPlans = New-ExoRequest -tenantid $Tenant -cmdlet 'Get-MailboxPlan' -cmdParams @{ ResultSize = 'Unlimited' }
-    }
-    catch {
+    } catch {
         $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
         Write-LogMessage -API 'Standards' -Tenant $Tenant -Message "Could not get the MailboxRecipientLimits state for $Tenant. Error: $ErrorMessage" -Sev Error
         return
@@ -257,11 +258,14 @@ function Invoke-CIPPStandardMailboxRecipientLimits {
         }
         Add-CIPPBPAField -FieldName 'MailboxRecipientLimits' -FieldValue $ReportData -StoreAs json -Tenant $Tenant
 
-        if ($MailboxesToUpdate.Count -eq 0 -and $MailboxesWithPlanIssues.Count -eq 0) {
-            $FieldValue = $true
-        } else {
-            $FieldValue = $ReportData
+        $CurrentValue = @{
+            MailboxesToUpdate       = @($MailboxesToUpdate)
+            MailboxesWithPlanIssues = @($MailboxesWithPlanIssues)
         }
-        Set-CIPPStandardsCompareField -FieldName 'standards.MailboxRecipientLimits' -FieldValue $FieldValue -Tenant $Tenant
+        $ExpectedValue = @{
+            MailboxesToUpdate       = @()
+            MailboxesWithPlanIssues = @()
+        }
+        Set-CIPPStandardsCompareField -FieldName 'standards.MailboxRecipientLimits' -CurrentValue $CurrentValue -ExpectedValue $ExpectedValue -Tenant $Tenant
     }
 }

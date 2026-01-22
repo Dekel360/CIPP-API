@@ -13,8 +13,12 @@ function Invoke-CIPPStandardDisableOutlookAddins {
         CAT
             Exchange Standards
         TAG
-            "CIS"
+            "CIS M365 5.0 (6.3.1)"
             "exo_outlookaddins"
+            "NIST CSF 2.0 (PR.AA-05)"
+            "NIST CSF 2.0 (PR.PS-05)"
+        EXECUTIVETEXT
+            Prevents employees from installing third-party add-ins in Outlook without administrative approval, reducing security risks from potentially malicious extensions. This ensures only vetted and approved tools can access company email data while maintaining centralized control over email functionality.
         ADDEDCOMPONENT
         IMPACT
             Medium Impact
@@ -37,13 +41,11 @@ function Invoke-CIPPStandardDisableOutlookAddins {
         Write-Host "We're exiting as the correct license is not present for this standard."
         return $true
     } #we're done.
-    ##$Rerun -Type Standard -Tenant $Tenant -Settings $Settings 'DisableOutlookAddins'
 
     try {
         $CurrentInfo = New-ExoRequest -tenantid $Tenant -cmdlet 'Get-RoleAssignmentPolicy' |
-        Where-Object { $_.IsDefault -eq $true }
-    }
-    catch {
+            Where-Object { $_.IsDefault -eq $true }
+    } catch {
         $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
         Write-LogMessage -API 'Standards' -Tenant $Tenant -Message "Could not get the DisableOutlookAddins state for $Tenant. Error: $ErrorMessage" -Sev Error
         return
@@ -93,8 +95,15 @@ function Invoke-CIPPStandardDisableOutlookAddins {
     }
     if ($Settings.report -eq $true) {
         $State = if ($RolesToRemove) { $false } else { $true }
-        $StateForCompare = if ($RolesToRemove) { @{ AllowedApps = $RolesToRemove } } else { $true }
-        Set-CIPPStandardsCompareField -FieldName 'standards.DisableOutlookAddins' -FieldValue $StateForCompare -TenantFilter $Tenant
+
+        $CurrentValue = [PSCustomObject]@{
+            DisabledOutlookAddins = $State
+        }
+        $ExpectedValue = [PSCustomObject]@{
+            DisabledOutlookAddins = $true
+        }
+
+        Set-CIPPStandardsCompareField -FieldName 'standards.DisableOutlookAddins' -CurrentValue $CurrentValue -ExpectedValue $ExpectedValue -TenantFilter $Tenant
         Add-CIPPBPAField -FieldName 'DisabledOutlookAddins' -FieldValue $State -StoreAs bool -Tenant $tenant
     }
 }

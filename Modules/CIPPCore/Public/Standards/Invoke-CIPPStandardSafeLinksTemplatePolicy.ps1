@@ -20,6 +20,8 @@ function Invoke-CIPPStandardSafeLinksTemplatePolicy {
             Medium Impact
         ADDEDDATE
             2025-04-29
+        EXECUTIVETEXT
+            Deploys standardized URL protection policies that automatically scan and verify links in emails and documents before users click them. This template-based approach ensures consistent protection against malicious websites and phishing attacks across the organization.
         ADDEDCOMPONENT
             {"type":"autoComplete","multiple":true,"creatable":false,"name":"standards.SafeLinksTemplatePolicy.TemplateIds","label":"Select SafeLinks Policy Templates","api":{"url":"/api/ListSafeLinksPolicyTemplates","labelField":"TemplateName","valueField":"GUID","queryKey":"ListSafeLinksPolicyTemplates"}}
         UPDATECOMMENTBLOCK
@@ -46,7 +48,7 @@ function Invoke-CIPPStandardSafeLinksTemplatePolicy {
     # Normalize template list property
     $TemplateList = Get-NormalizedTemplateList -Settings $Settings
     if (-not $TemplateList) {
-        Write-LogMessage -API 'Standards' -tenant $Tenant -message "No templates selected for SafeLinks policy deployment" -sev Error
+        Write-LogMessage -API 'Standards' -tenant $Tenant -message 'No templates selected for SafeLinks policy deployment' -sev Error
         return
     }
 
@@ -99,8 +101,7 @@ function Get-NormalizedTemplateList {
 
     if ($Settings.'standards.SafeLinksTemplatePolicy.TemplateIds') {
         return $Settings.'standards.SafeLinksTemplatePolicy.TemplateIds'
-    }
-    elseif ($Settings.TemplateIds) {
+    } elseif ($Settings.TemplateIds) {
         return $Settings.TemplateIds
     }
 
@@ -132,17 +133,13 @@ function ConvertTo-SafeArray {
         foreach ($item in $Field) {
             if ($item -is [string]) {
                 $ResultList.Add($item)
-            }
-            elseif ($item.value) {
+            } elseif ($item.value) {
                 $ResultList.Add($item.value)
-            }
-            elseif ($item.userPrincipalName) {
+            } elseif ($item.userPrincipalName) {
                 $ResultList.Add($item.userPrincipalName)
-            }
-            elseif ($item.id) {
+            } elseif ($item.id) {
                 $ResultList.Add($item.id)
-            }
-            else {
+            } else {
                 $ResultList.Add($item.ToString())
             }
         }
@@ -182,22 +179,20 @@ function Get-ExistingSafeLinksObjects {
     try {
         $ExistingPolicies = New-ExoRequest -tenantid $Tenant -cmdlet 'Get-SafeLinksPolicy' -useSystemMailbox $true
         $PolicyExists = $ExistingPolicies | Where-Object { $_.Name -eq $PolicyName }
-    }
-    catch {
+    } catch {
         Write-LogMessage -API 'Standards' -tenant $Tenant -message "Failed to retrieve existing policies: $($_.Exception.Message)" -sev Warning
     }
 
     try {
         $ExistingRules = New-ExoRequest -tenantid $Tenant -cmdlet 'Get-SafeLinksRule' -useSystemMailbox $true
         $RuleExists = $ExistingRules | Where-Object { $_.Name -eq $RuleName }
-    }
-    catch {
+    } catch {
         Write-LogMessage -API 'Standards' -tenant $Tenant -message "Failed to retrieve existing rules: $($_.Exception.Message)" -sev Warning
     }
 
     return @{
         PolicyExists = $PolicyExists
-        RuleExists = $RuleExists
+        RuleExists   = $RuleExists
     }
 }
 
@@ -205,17 +200,17 @@ function New-SafeLinksPolicyParameters {
     param($Template)
 
     $PolicyMappings = @{
-        'EnableSafeLinksForEmail' = 'EnableSafeLinksForEmail'
-        'EnableSafeLinksForTeams' = 'EnableSafeLinksForTeams'
-        'EnableSafeLinksForOffice' = 'EnableSafeLinksForOffice'
-        'TrackClicks' = 'TrackClicks'
-        'AllowClickThrough' = 'AllowClickThrough'
-        'ScanUrls' = 'ScanUrls'
-        'EnableForInternalSenders' = 'EnableForInternalSenders'
-        'DeliverMessageAfterScan' = 'DeliverMessageAfterScan'
-        'DisableUrlRewrite' = 'DisableUrlRewrite'
-        'AdminDisplayName' = 'AdminDisplayName'
-        'CustomNotificationText' = 'CustomNotificationText'
+        'EnableSafeLinksForEmail'    = 'EnableSafeLinksForEmail'
+        'EnableSafeLinksForTeams'    = 'EnableSafeLinksForTeams'
+        'EnableSafeLinksForOffice'   = 'EnableSafeLinksForOffice'
+        'TrackClicks'                = 'TrackClicks'
+        'AllowClickThrough'          = 'AllowClickThrough'
+        'ScanUrls'                   = 'ScanUrls'
+        'EnableForInternalSenders'   = 'EnableForInternalSenders'
+        'DeliverMessageAfterScan'    = 'DeliverMessageAfterScan'
+        'DisableUrlRewrite'          = 'DisableUrlRewrite'
+        'AdminDisplayName'           = 'AdminDisplayName'
+        'CustomNotificationText'     = 'CustomNotificationText'
         'EnableOrganizationBranding' = 'EnableOrganizationBranding'
     }
 
@@ -247,11 +242,11 @@ function New-SafeLinksRuleParameters {
 
     # Array-based rule parameters
     $ArrayMappings = @{
-        'SentTo' = ConvertTo-SafeArray -Field $Template.SentTo
-        'SentToMemberOf' = ConvertTo-SafeArray -Field $Template.SentToMemberOf
-        'RecipientDomainIs' = ConvertTo-SafeArray -Field $Template.RecipientDomainIs
-        'ExceptIfSentTo' = ConvertTo-SafeArray -Field $Template.ExceptIfSentTo
-        'ExceptIfSentToMemberOf' = ConvertTo-SafeArray -Field $Template.ExceptIfSentToMemberOf
+        'SentTo'                    = ConvertTo-SafeArray -Field $Template.SentTo
+        'SentToMemberOf'            = ConvertTo-SafeArray -Field $Template.SentToMemberOf
+        'RecipientDomainIs'         = ConvertTo-SafeArray -Field $Template.RecipientDomainIs
+        'ExceptIfSentTo'            = ConvertTo-SafeArray -Field $Template.ExceptIfSentTo
+        'ExceptIfSentToMemberOf'    = ConvertTo-SafeArray -Field $Template.ExceptIfSentToMemberOf
         'ExceptIfRecipientDomainIs' = ConvertTo-SafeArray -Field $Template.ExceptIfRecipientDomainIs
     }
 
@@ -270,8 +265,8 @@ function Set-SafeLinksRuleState {
     if ($null -eq $State) { return }
 
     $IsEnabled = switch ($State) {
-        "Enabled" { $true }
-        "Disabled" { $false }
+        'Enabled' { $true }
+        'Disabled' { $false }
         $true { $true }
         $false { $false }
         default { $null }
@@ -280,7 +275,7 @@ function Set-SafeLinksRuleState {
     if ($null -ne $IsEnabled) {
         $Cmdlet = $IsEnabled ? 'Enable-SafeLinksRule' : 'Disable-SafeLinksRule'
         $null = New-ExoRequest -tenantid $Tenant -cmdlet $Cmdlet -cmdParams @{ Identity = $RuleName } -useSystemMailbox $true
-        return $IsEnabled ? "enabled" : "disabled"
+        return $IsEnabled ? 'enabled' : 'disabled'
     }
 
     return $null
@@ -318,8 +313,7 @@ function Invoke-SafeLinksRemediation {
                 $null = New-ExoRequest -tenantid $Tenant -cmdlet 'Set-SafeLinksPolicy' -cmdParams $PolicyParams -useSystemMailbox $true
                 $ActionsTaken.Add("Updated SafeLinks policy '$PolicyName'")
                 Write-LogMessage -API 'Standards' -tenant $Tenant -message "Updated SafeLinks policy '$PolicyName'" -sev Info
-            }
-            else {
+            } else {
                 # Create new policy
                 $PolicyParams['Name'] = $PolicyName
                 $null = New-ExoRequest -tenantid $Tenant -cmdlet 'New-SafeLinksPolicy' -cmdParams $PolicyParams -useSystemMailbox $true
@@ -336,8 +330,7 @@ function Invoke-SafeLinksRemediation {
                 $null = New-ExoRequest -tenantid $Tenant -cmdlet 'Set-SafeLinksRule' -cmdParams $RuleParams -useSystemMailbox $true
                 $ActionsTaken.Add("Updated SafeLinks rule '$RuleName'")
                 Write-LogMessage -API 'Standards' -tenant $Tenant -message "Updated SafeLinks rule '$RuleName'" -sev Info
-            }
-            else {
+            } else {
                 # Create new rule
                 $RuleParams['Name'] = $RuleName
                 $RuleParams['SafeLinksPolicy'] = $PolicyName
@@ -354,21 +347,20 @@ function Invoke-SafeLinksRemediation {
             }
 
             $TemplateResults[$TemplateId] = @{
-                Success = $true
+                Success      = $true
                 ActionsTaken = $ActionsTaken.ToArray()
                 TemplateName = $Template.TemplateName ?? $Template.Name
-                PolicyName = $PolicyName
-                RuleName = $RuleName
+                PolicyName   = $PolicyName
+                RuleName     = $RuleName
             }
 
             Write-LogMessage -API 'Standards' -tenant $Tenant -message "Successfully applied SafeLinks template '$($Template.TemplateName ?? $Template.Name)'" -sev Info
-        }
-        catch {
+        } catch {
             $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
             $TemplateResults[$TemplateId] = @{
-                Success = $false
-                Message = $ErrorMessage
-                TemplateName = $Template.TemplateName ?? $Template.Name ?? "Unknown"
+                Success      = $false
+                Message      = $ErrorMessage
+                TemplateName = $Template.TemplateName ?? $Template.Name ?? 'Unknown'
             }
             $OverallSuccess = $false
 
@@ -378,9 +370,8 @@ function Invoke-SafeLinksRemediation {
 
     # Report overall results
     if ($OverallSuccess) {
-        Write-LogMessage -API 'Standards' -tenant $Tenant -message "Successfully applied all SafeLinks templates" -sev Info
-    }
-    else {
+        Write-LogMessage -API 'Standards' -tenant $Tenant -message 'Successfully applied all SafeLinks templates' -sev Info
+    } else {
         $SuccessCount = ($TemplateResults.Values | Where-Object { $_.Success -eq $true }).Count
         $TotalCount = $TemplateList.Count
         Write-LogMessage -API 'Standards' -tenant $Tenant -message "Applied $SuccessCount out of $TotalCount SafeLinks templates" -sev Info
@@ -417,8 +408,7 @@ function Invoke-SafeLinksAlert {
 
                 $AlertMessages.Add($Status)
             }
-        }
-        catch {
+        } catch {
             $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
             $AlertMessages.Add("Failed to check template with ID $TemplateId : $ErrorMessage")
             $AllTemplatesApplied = $false
@@ -426,13 +416,12 @@ function Invoke-SafeLinksAlert {
     }
 
     if ($AllTemplatesApplied) {
-        Write-LogMessage -API 'Standards' -tenant $Tenant -message "All SafeLinks templates are correctly applied" -sev Info
-    }
-    else {
-        $AlertMessage = "One or more SafeLinks templates are not correctly applied: " + ($AlertMessages.ToArray() -join " | ")
+        Write-LogMessage -API 'Standards' -tenant $Tenant -message 'All SafeLinks templates are correctly applied' -sev Info
+    } else {
+        $AlertMessage = 'One or more SafeLinks templates are not correctly applied: ' + ($AlertMessages.ToArray() -join ' | ')
         Write-StandardsAlert -message $AlertMessage -object @{
             Templates = $TemplateList
-            Issues = $AlertMessages.ToArray()
+            Issues    = $AlertMessages.ToArray()
         } -tenant $Tenant -standardName 'SafeLinksTemplatePolicy' -standardId $Settings.standardId
 
         Write-LogMessage -API 'Standards' -tenant $Tenant -message $AlertMessage -sev Info
@@ -456,19 +445,18 @@ function Invoke-SafeLinksReport {
             $ExistingObjects = Get-ExistingSafeLinksObjects -Tenant $Tenant -PolicyName $PolicyName -RuleName $RuleName
 
             $ReportResults[$TemplateId] = @{
-                Success = ($ExistingObjects.PolicyExists -and $ExistingObjects.RuleExists)
+                Success      = ($ExistingObjects.PolicyExists -and $ExistingObjects.RuleExists)
                 TemplateName = $Template.TemplateName ?? $Template.Name
-                PolicyName = $PolicyName
-                RuleName = $RuleName
+                PolicyName   = $PolicyName
+                RuleName     = $RuleName
                 PolicyExists = [bool]$ExistingObjects.PolicyExists
-                RuleExists = [bool]$ExistingObjects.RuleExists
+                RuleExists   = [bool]$ExistingObjects.RuleExists
             }
 
             if (-not $ExistingObjects.PolicyExists -or -not $ExistingObjects.RuleExists) {
                 $AllTemplatesApplied = $false
             }
-        }
-        catch {
+        } catch {
             $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
             $ReportResults[$TemplateId] = @{
                 Success = $false
@@ -480,14 +468,18 @@ function Invoke-SafeLinksReport {
 
     Add-CIPPBPAField -FieldName 'SafeLinksTemplatePolicy' -FieldValue $AllTemplatesApplied -StoreAs bool -Tenant $Tenant
 
-    if ($AllTemplatesApplied) {
-        Set-CIPPStandardsCompareField -FieldName 'standards.SafeLinksTemplatePolicy' -FieldValue $true -Tenant $Tenant
+    $CurrentValue = @{
+        TemplateResults     = $ReportResults
+        ProcessedTemplates  = $TemplateList.Count
+        SuccessfulTemplates = ($ReportResults.Values | Where-Object { $_.Success -eq $true }).Count
+        AllTemplatesApplied = $AllTemplatesApplied
     }
-    else {
-        Set-CIPPStandardsCompareField -FieldName 'standards.SafeLinksTemplatePolicy' -FieldValue @{
-            TemplateResults = $ReportResults
-            ProcessedTemplates = $TemplateList.Count
-            SuccessfulTemplates = ($ReportResults.Values | Where-Object { $_.Success -eq $true }).Count
-        } -Tenant $Tenant
+    $ExpectedValue = @{
+        TemplateResults     = $ReportResults
+        ProcessedTemplates  = $TemplateList.Count
+        SuccessfulTemplates = $TemplateList.Count
+        AllTemplatesApplied = $true
     }
+
+    Set-CIPPStandardsCompareField -FieldName 'standards.SafeLinksTemplatePolicy' -CurrentValue $CurrentValue -ExpectedValue $ExpectedValue -Tenant $Tenant
 }

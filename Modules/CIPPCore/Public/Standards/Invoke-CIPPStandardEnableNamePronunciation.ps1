@@ -13,6 +13,8 @@ function Invoke-CIPPStandardEnableNamePronunciation {
         CAT
             Global Standards
         TAG
+        EXECUTIVETEXT
+            Enables employees to add pronunciation guides for their names in Microsoft 365 profiles, improving communication and respect in diverse workplaces. This feature helps colleagues pronounce names correctly, enhancing professional relationships and inclusive culture.
         ADDEDCOMPONENT
         IMPACT
             Low Impact
@@ -34,7 +36,7 @@ function Invoke-CIPPStandardEnableNamePronunciation {
     } catch {
         $ErrorMessage = Get-CippException -Exception $_
         Write-LogMessage -API 'Standards' -tenant $Tenant -message "Could not get CurrentState for Name Pronunciation. Error: $($ErrorMessage.NormalizedError)" -sev Error
-        Return
+        return
     }
     Write-Host $CurrentState
 
@@ -67,7 +69,14 @@ function Invoke-CIPPStandardEnableNamePronunciation {
     }
 
     if ($Settings.report -eq $true) {
-        Set-CIPPStandardsCompareField -FieldName 'standards.EnableNamePronunciation' -FieldValue $CurrentState.isEnabledInOrganization -Tenant $tenant
+        $CurrentValue = [PSCustomObject]@{
+            EnableNamePronunciation = $CurrentState.isEnabledInOrganization
+        }
+        $ExpectedValue = [PSCustomObject]@{
+            EnableNamePronunciation = $true
+        }
+
+        Set-CIPPStandardsCompareField -FieldName 'standards.EnableNamePronunciation' -CurrentValue $CurrentValue -ExpectedValue $ExpectedValue -Tenant $tenant
         Add-CIPPBPAField -FieldName 'NamePronunciationEnabled' -FieldValue $CurrentState.isEnabledInOrganization -StoreAs bool -Tenant $tenant
     }
 }

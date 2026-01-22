@@ -13,11 +13,15 @@ function Invoke-CIPPStandardStaleEntraDevices {
         CAT
             Entra (AAD) Standards
         TAG
-            "CIS"
+            "Essential 8 (1501)"
+            "NIST CSF 2.0 (ID.AM-08)"
+            "NIST CSF 2.0 (PR.PS-03)"
+        EXECUTIVETEXT
+            Automatically identifies and removes inactive devices that haven't connected to company systems for a specified period, reducing security risks from abandoned or lost devices. This maintains a clean device inventory and prevents potential unauthorized access through dormant device registrations.
         ADDEDCOMPONENT
             {"type":"number","name":"standards.StaleEntraDevices.deviceAgeThreshold","label":"Days before stale(Do not set below 30)"}
         DISABLEDFEATURES
-            {"report":false,"warn":false,"remediate":true}
+            {"report":false,"warn":false,"remediate":false}
         IMPACT
             High Impact
         ADDEDDATE
@@ -43,8 +47,7 @@ function Invoke-CIPPStandardStaleEntraDevices {
 
     try {
         $AllDevices = New-GraphGetRequest -uri 'https://graph.microsoft.com/beta/devices' -tenantid $Tenant | Where-Object { $null -ne $_.approximateLastSignInDateTime }
-    }
-    catch {
+    } catch {
         $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
         Write-LogMessage -API 'Standards' -Tenant $Tenant -Message "Could not get the StaleEntraDevices state for $Tenant. Error: $ErrorMessage" -Sev Error
         return
@@ -91,9 +94,18 @@ function Invoke-CIPPStandardStaleEntraDevices {
 
         if ($StaleDevices.Count -gt 0) {
             $FieldValue = $StaleDevices | Select-Object -Property displayName, id, approximateLastSignInDateTime, accountEnabled, enrollmentProfileName, operatingSystem, managementType, profileType
-        } else {
-            $FieldValue = $true
         }
-        Set-CIPPStandardsCompareField -FieldName 'standards.StaleEntraDevices' -FieldValue $FieldValue -Tenant $Tenant
+
+        $CurrentValue = @{
+            StaleDevicesCount  = $StaleDevices.Count
+            StaleDevices       = ($FieldValue ? @($FieldValue) :@())
+            DeviceAgeThreshold = [int]$Settings.deviceAgeThreshold
+        }
+        $ExpectedValue = @{
+            StaleDevicesCount  = 0
+            StaleDevices       = @()
+            DeviceAgeThreshold = [int]$Settings.deviceAgeThreshold
+        }
+        Set-CIPPStandardsCompareField -FieldName 'standards.StaleEntraDevices' -CurrentValue $CurrentValue -ExpectedValue $ExpectedValue -Tenant $Tenant
     }
 }

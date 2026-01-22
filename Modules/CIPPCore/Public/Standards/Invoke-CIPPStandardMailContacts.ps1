@@ -13,6 +13,8 @@ function Invoke-CIPPStandardMailContacts {
         CAT
             Global Standards
         TAG
+        EXECUTIVETEXT
+            Establishes designated contact email addresses for receiving important Microsoft 365 subscription updates and notifications. This ensures proper communication channels are maintained for general, security, marketing, and technical matters, improving organizational responsiveness to critical system updates.
         ADDEDCOMPONENT
             {"type":"textField","name":"standards.MailContacts.GeneralContact","label":"General Contact","required":false}
             {"type":"textField","name":"standards.MailContacts.SecurityContact","label":"Security Contact","required":false}
@@ -32,7 +34,6 @@ function Invoke-CIPPStandardMailContacts {
     #>
 
     param($Tenant, $Settings)
-    ##$Rerun -Type Standard -Tenant $Tenant -Settings $Settings 'MailContacts'
 
     try {
         $TenantID = (New-GraphGetRequest -Uri 'https://graph.microsoft.com/beta/organization' -tenantid $tenant)
@@ -105,8 +106,17 @@ function Invoke-CIPPStandardMailContacts {
 
     }
     if ($Settings.report -eq $true) {
-        $ReportState = $state ? $true : ($CurrentInfo | Select-Object marketingNotificationEmails, technicalNotificationMails, privacyProfile)
-        Set-CIPPStandardsCompareField -FieldName 'standards.MailContacts' -FieldValue $ReportState -Tenant $tenant
+        $CurrentValue = @{
+            marketingNotificationEmails = $CurrentInfo.marketingNotificationEmails
+            technicalNotificationMails  = @($CurrentInfo.technicalNotificationMails)
+            contactEmail                = $CurrentInfo.privacyProfile.contactEmail
+        }
+        $ExpectedValue = @{
+            marketingNotificationEmails = $Contacts.MarketingContact
+            technicalNotificationMails  = @($Contacts.SecurityContact, $Contacts.TechContact) | Where-Object { $_ -ne $null }
+            contactEmail                = $Contacts.GeneralContact
+        }
+        Set-CIPPStandardsCompareField -FieldName 'standards.MailContacts' -CurrentValue $CurrentValue -ExpectedValue $ExpectedValue -Tenant $tenant
         Add-CIPPBPAField -FieldName 'MailContacts' -FieldValue $CurrentInfo -StoreAs json -Tenant $tenant
     }
 }

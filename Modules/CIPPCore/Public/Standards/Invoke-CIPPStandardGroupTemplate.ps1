@@ -20,6 +20,8 @@ function Invoke-CIPPStandardGroupTemplate {
             Medium Impact
         ADDEDDATE
             2023-12-30
+        EXECUTIVETEXT
+            Creates standardized groups with predefined settings, permissions, and membership rules. These templates ensure consistent group configurations across the organization, streamlining collaboration and access management while maintaining security standards.
         ADDEDCOMPONENT
             {"type":"autoComplete","name":"groupTemplate","label":"Select Group Template","api":{"url":"/api/ListGroupTemplates","labelField":"Displayname","altLabelField":"displayName","valueField":"GUID","queryKey":"ListGroupTemplates"}}
         UPDATECOMMENTBLOCK
@@ -29,7 +31,6 @@ function Invoke-CIPPStandardGroupTemplate {
     #>
     param($Tenant, $Settings)
 
-    ##$Rerun -Type Standard -Tenant $Tenant -Settings $Settings 'GroupTemplate'
     $existingGroups = New-GraphGETRequest -uri 'https://graph.microsoft.com/beta/groups?$top=999' -tenantid $tenant
 
     $TestResult = Test-CIPPStandardLicense -StandardName 'GroupTemplate' -TenantFilter $Tenant -RequiredCapabilities @('EXCHANGE_S_STANDARD', 'EXCHANGE_S_ENTERPRISE', 'EXCHANGE_LITE') -SkipLog
@@ -240,12 +241,13 @@ function Invoke-CIPPStandardGroupTemplate {
             }
         }
 
-        if ($MissingGroups.Count -eq 0) {
-            $fieldValue = $true
-        } else {
-            $fieldValue = $MissingGroups -join ', '
+        $CurrentValue = @{
+            MissingGroups = $MissingGroups ? @($MissingGroups) : @()
+        }
+        $ExpectedValue = @{
+            MissingGroups = @()
         }
 
-        Set-CIPPStandardsCompareField -FieldName 'standards.GroupTemplate' -FieldValue $fieldValue -Tenant $Tenant
+        Set-CIPPStandardsCompareField -FieldName 'standards.GroupTemplate' -CurrentValue $CurrentValue -ExpectedValue $ExpectedValue -TenantFilter $Tenant
     }
 }
