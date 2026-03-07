@@ -126,8 +126,22 @@ function Push-CIPPStandardsList {
 
                     # Filter unchanged templates
                     $TemplateTable = Get-CippTable -tablename 'templates'
-                    $StandardTemplateTable = Get-CippTable -tablename 'templates'
                     $IntuneKeys = @($ComputedStandards.Keys | Where-Object { $_ -like '*IntuneTemplate*' })
+
+                    # Build compliance lookup - keyed by "standards.IntuneTemplate.<templateValue>"
+                    $IntuneComplianceLookup = @{}
+                    try {
+                        $AlignmentResults = Get-CIPPTenantAlignment -TenantFilter $TenantFilter
+                        foreach ($AlignmentResult in $AlignmentResults) {
+                            foreach ($Detail in $AlignmentResult.ComparisonDetails) {
+                                if ($Detail.StandardName -like 'standards.IntuneTemplate.*') {
+                                    $IntuneComplianceLookup[$Detail.StandardName] = $Detail.Compliant
+                                }
+                            }
+                        }
+                    } catch {
+                        Write-Warning "Failed to get tenant alignment data for $TenantFilter : $($_.Exception.Message)"
+                    }
 
                     foreach ($Key in $IntuneKeys) {
                         $Template = $ComputedStandards[$Key]
@@ -168,13 +182,62 @@ function Push-CIPPStandardsList {
                             } -Force | Out-Null
                         }
 
-                        # Remove if both unchanged
+                        # Remove or downgrade based on change state and compliance
                         if (-not $PolicyChanged -and -not $StandardTemplateChanged) {
-x                            [void]$ComputedStandards.Remove($Key)
+                            $AlignmentKey = "standards.IntuneTemplate.$($Template.Settings.TemplateList.value)"
+                            $IsDeployed = $IntuneComplianceLookup.ContainsKey($AlignmentKey)
+                            $IsCompliant = $IsDeployed -and ($IntuneComplianceLookup[$AlignmentKey] -eq $true)
+
+                            if ($IsCompliant) {
+                                # Policy unchanged and compliant - no action needed
+                                Write-Host "NO INTUNE CHANGE: Filtering out $Key for $TenantFilter (compliant)"
+                                [void]$ComputedStandards.Remove($Key)
+                            } elseif ($IsDeployed) {
+                                # Policy deployed but drifted, and nothing changed - report only, don't force remediate
+                                Write-Host "COMPLIANCE DRIFT: Downgrading $Key to Report mode for $TenantFilter (deployed, not compliant, no changes)"
+                                $ComputedStandards[$Key].Settings | Add-Member -NotePropertyName 'remediate' -NotePropertyValue $false -Force
+                                $ComputedStandards[$Key].Settings | Add-Member -NotePropertyName 'report' -NotePropertyValue $true -Force
+                            } else {
+                                # No alignment data yet - policy not yet deployed, skip (will run on next cycle with changes)
+                                Write-Host "NO INTUNE CHANGE: Filtering out $Key for $TenantFilter (not yet deployed, no changes)"
+                                [void]$ComputedStandards.Remove($Key)
+                            }
                         }
                     }
                 } catch {
                     Write-Warning "Timestamp check failed for $TenantFilter : $($_.Exception.Message)"
+                }
+            }
+        }
+
+        $CAStandardFound = ($ComputedStandards.Keys.Where({ $_ -like '*ConditionalAccessTemplate*' }, 'First').Count -gt 0)
+        if ($CAStandardFound) {
+            $TestResult = Test-CIPPStandardLicense -StandardName 'ConditionalAccessTemplate_general' -TenantFilter $TenantFilter -RequiredCapabilities @('AAD_PREMIUM', 'AAD_PREMIUM_P2')
+            if (-not $TestResult) {
+                $CAKeys = @($ComputedStandards.Keys | Where-Object { $_ -like '*ConditionalAccessTemplate*' })
+                $BulkFields = [System.Collections.Generic.List[object]]::new()
+                foreach ($Key in $CAKeys) {
+                    $TemplateKey = ($Key -split '\|', 2)[1]
+                    if ($TemplateKey) {
+                        $BulkFields.Add([PSCustomObject]@{
+                                FieldName  = "standards.ConditionalAccessTemplate.$TemplateKey"
+                                FieldValue = 'This tenant does not have the required license for this standard.'
+                            })
+                    }
+                    [void]$ComputedStandards.Remove($Key)
+                }
+                if ($BulkFields.Count -gt 0) {
+                    Set-CIPPStandardsCompareField -TenantFilter $TenantFilter -BulkFields $BulkFields
+                }
+
+                Write-Information "Removed ConditionalAccessTemplate standards for $TenantFilter - missing required license"
+            } else {
+                # License valid - update CIPPDB cache with latest CA information before we run so that standards have the most up to date info
+                try {
+                    Write-Information "Updating CIPPDB cache for Conditional Access policies for $TenantFilter"
+                    Set-CIPPDBCacheConditionalAccessPolicies -TenantFilter $TenantFilter
+                } catch {
+                    Write-Warning "Failed to update CA cache for $TenantFilter : $($_.Exception.Message)"
                 }
             }
         }
