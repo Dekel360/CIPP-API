@@ -40,14 +40,12 @@ function Invoke-CIPPStandardEXODisableAutoForwarding {
     $TestResult = Test-CIPPStandardLicense -StandardName 'EXODisableAutoForwarding' -TenantFilter $Tenant -RequiredCapabilities @('EXCHANGE_S_STANDARD', 'EXCHANGE_S_ENTERPRISE', 'EXCHANGE_S_STANDARD_GOV', 'EXCHANGE_S_ENTERPRISE_GOV', 'EXCHANGE_LITE') #No Foundation because that does not allow powershell access
 
     if ($TestResult -eq $false) {
-        Write-Host "We're exiting as the correct license is not present for this standard."
         return $true
     } #we're done.
 
     try {
         $CurrentInfo = New-ExoRequest -tenantid $Tenant -cmdlet 'Get-HostedOutboundSpamFilterPolicy' -cmdParams @{Identity = 'Default' } -useSystemMailbox $true
-    }
-    catch {
+    } catch {
         $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
         Write-LogMessage -API 'Standards' -Tenant $Tenant -Message "Could not get the EXODisableAutoForwarding state for $Tenant. Error: $ErrorMessage" -Sev Error
         return
@@ -55,12 +53,16 @@ function Invoke-CIPPStandardEXODisableAutoForwarding {
     $StateIsCorrect = $CurrentInfo.AutoForwardingMode -eq 'Off'
 
     if ($Settings.remediate -eq $true) {
-        try {
-            New-ExoRequest -tenantid $tenant -cmdlet 'Set-HostedOutboundSpamFilterPolicy' -cmdParams @{ Identity = 'Default'; AutoForwardingMode = 'Off' } -useSystemMailbox $true
-            Write-LogMessage -API 'Standards' -tenant $tenant -message 'Disabled auto forwarding' -sev Info
-        } catch {
-            $ErrorMessage = Get-CippException -Exception $_
-            Write-LogMessage -API 'Standards' -tenant $tenant -message "Could not disable auto forwarding. $($ErrorMessage.NormalizedError)" -sev Error
+        if ($StateIsCorrect -eq $true) {
+            Write-LogMessage -API 'Standards' -tenant $tenant -message 'Auto forwarding is already disabled.' -sev Info
+        } else {
+            try {
+                New-ExoRequest -tenantid $tenant -cmdlet 'Set-HostedOutboundSpamFilterPolicy' -cmdParams @{ Identity = 'Default'; AutoForwardingMode = 'Off' } -useSystemMailbox $true
+                Write-LogMessage -API 'Standards' -tenant $tenant -message 'Disabled auto forwarding' -sev Info
+            } catch {
+                $ErrorMessage = Get-CippException -Exception $_
+                Write-LogMessage -API 'Standards' -tenant $tenant -message "Could not disable auto forwarding. $($ErrorMessage.NormalizedError)" -sev Error
+            }
         }
     }
 

@@ -36,7 +36,6 @@ function Invoke-CIPPStandardSharePointMassDeletionAlert {
     $TestResult = Test-CIPPStandardLicense -StandardName 'DeletedUserRentention' -TenantFilter $Tenant -RequiredCapabilities @('RMS_S_PREMIUM2')
 
     if ($TestResult -eq $false) {
-        Write-Host "We're exiting as the correct license is not present for this standard."
         return $true
     } #we're done.
 
@@ -44,8 +43,7 @@ function Invoke-CIPPStandardSharePointMassDeletionAlert {
 
     try {
         $CurrentState = New-ExoRequest -TenantId $Tenant -cmdlet 'Get-ProtectionAlert' -Compliance |
-            Where-Object { $_.Name -eq $PolicyName } |
-            Select-Object -Property *
+            Where-Object { $_.Name -eq $PolicyName }
     } catch {
         $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
         Write-LogMessage -API 'Standards' -Tenant $Tenant -Message "Could not get the sharingCapability state for $Tenant. Error: $ErrorMessage" -Sev Error
@@ -68,7 +66,7 @@ function Invoke-CIPPStandardSharePointMassDeletionAlert {
 
     if ($Settings.remediate -eq $true) {
         if ($StateIsCorrect -eq $true) {
-            Write-LogMessage -API 'Standards' -Tenant $Tenant -Message 'SharePoint mass deletion of files alert is configured correctly' -sev Info
+            Write-LogMessage -API 'Standards' -Tenant $Tenant -Message 'SharePoint mass deletion of files alert is already configured correctly.' -sev Info
         } else {
             $cmdParams = @{
                 'NotifyUser'      = $Settings.NotifyUser.value
