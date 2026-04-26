@@ -38,6 +38,7 @@ function New-CIPPBackup {
                         'AccessRoleGroups'
                         'ApiClients'
                         'CippReplacemap'
+                        'CustomPowershellScripts'
                         'CustomData'
                         'CustomRoles'
                         'Config'
@@ -54,10 +55,20 @@ function New-CIPPBackup {
                         'WebhookRules'
                         'ScheduledTasks'
                         'TenantProperties'
+                        'TenantGroups'
+                        'TenantGroupMembers'
                     )
                     $CSVfile = foreach ($CSVTable in $BackupTables) {
                         $Table = Get-CippTable -tablename $CSVTable
-                        Get-AzDataTableEntity @Table | Select-Object * -ExcludeProperty DomainAnalyser, table, Timestamp, ETag, Results | Select-Object *, @{l = 'table'; e = { $CSVTable } }
+                        $Entities = if ($CSVTable -eq 'ScheduledTasks') {
+                            Get-AzDataTableEntity @Table -Filter "TaskState ne 'Completed'"
+                        } else {
+                            Get-AzDataTableEntity @Table
+                        }
+                        if ($CSVTable -eq 'Config') {
+                            $Entities = $Entities | Where-Object { $_.PartitionKey -ne 'OffloadFunctions' }
+                        }
+                        $Entities | Select-Object * -ExcludeProperty DomainAnalyser, table, Timestamp, ETag, Results | Select-Object *, @{l = 'table'; e = { $CSVTable } }
                     }
                     $RowKey = 'CIPPBackup' + '_' + (Get-Date).ToString('yyyy-MM-dd-HHmm')
                     $BackupData = [string]($CSVfile | ConvertTo-Json -Compress -Depth 100)
@@ -145,6 +156,7 @@ function New-CIPPBackup {
         } catch {
             $ErrorMessage = Get-CippException -Exception $_
             Write-LogMessage -headers $Headers -API $APINAME -message "Blob upload failed: $($ErrorMessage.NormalizedError)" -Sev 'Error' -LogData $ErrorMessage
+            return [pscustomobject]@{'Results' = "Blob Upload failed: $($ErrorMessage.NormalizedError)" }
         }
 
         # Write table entity pointing to blob resource
