@@ -14,6 +14,17 @@ function Get-CIPPDomainAnalyser {
     #>
     [CmdletBinding()]
     param([string]$TenantFilter)
+
+    if (-not $script:CIPPDomainAnalyserCache) {
+        $script:CIPPDomainAnalyserCache = @{}
+    }
+    $CacheKey = if ([string]::IsNullOrEmpty($TenantFilter)) { 'AllTenants' } else { $TenantFilter }
+    $CacheNow = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $CachedEntry = $script:CIPPDomainAnalyserCache[$CacheKey]
+    if ($CachedEntry -and ($CacheNow - $CachedEntry.Timestamp) -lt 300) {
+        return $CachedEntry.Results
+    }
+
     $DomainTable = Get-CIPPTable -Table 'Domains'
 
     # Get all the things
@@ -26,11 +37,16 @@ function Get-CIPPDomainAnalyser {
     }
     $Domains = Get-CIPPAzDataTableEntity @DomainTable | Where-Object { $_.TenantGUID -in $Tenants.customerId -or $TenantFilter -eq $_.TenantGUID }
     try {
-        # Extract json from table results
-        $Results = foreach ($DomainAnalyserResult in ($Domains).DomainAnalyser) {
+        # Extract json from table results and merge with DkimSelectors from the domain entity
+        $Results = foreach ($Domain in $Domains) {
             try {
-                if (![string]::IsNullOrEmpty($DomainAnalyserResult)) {
-                    $Object = $DomainAnalyserResult | ConvertFrom-Json -ErrorAction SilentlyContinue
+                if (![string]::IsNullOrEmpty($Domain.DomainAnalyser)) {
+                    $Object = $Domain.DomainAnalyser | ConvertFrom-Json -ErrorAction SilentlyContinue
+                    # Add DkimSelectors from the domain entity if available
+                    if (![string]::IsNullOrEmpty($Domain.DkimSelectors)) {
+                        $Selectors = $Domain.DkimSelectors | ConvertFrom-Json -ErrorAction SilentlyContinue
+                        $Object | Add-Member -NotePropertyName 'DkimSelectors' -NotePropertyValue ($Selectors) -Force
+                    }
                     $Object
                 }
             } catch {}
@@ -38,5 +54,6 @@ function Get-CIPPDomainAnalyser {
     } catch {
         $Results = @()
     }
+    $script:CIPPDomainAnalyserCache[$CacheKey] = @{ Results = $Results; Timestamp = $CacheNow }
     return $Results
 }
