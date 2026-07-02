@@ -8,6 +8,7 @@ function Test-CIPPGDAPRelationships {
 
     $GDAPissues = [System.Collections.Generic.List[object]]@()
     $MissingGroups = [System.Collections.Generic.List[object]]@()
+    $RoleMappingResults = [System.Collections.Generic.List[object]]@()
     try {
         #Get graph request to list all relationships.
         $Relationships = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/tenantRelationships/delegatedAdminRelationships?`$filter=status eq 'active'" -tenantid $env:TenantID -NoAuthCheck $true
@@ -20,7 +21,7 @@ function Test-CIPPGDAPRelationships {
                         Issue        = 'This tenant only has a MLT(Microsoft Led Transition) relationship. This is a read-only relationship. You must migrate this tenant to GDAP.'
                         Tenant       = [string]$Tenant.Group.customer.displayName
                         Relationship = [string]$Tenant.Group.displayName
-                        Link         = 'https://docs.cipp.app/setup/gdap/index'
+                        Link         = 'https://docs.cipp.app/setup/installation/gdap-invite-wizard'
                     }) | Out-Null
             }
             foreach ($Group in $Tenant.Group) {
@@ -53,46 +54,84 @@ function Test-CIPPGDAPRelationships {
             'M365 GDAP SharePoint Administrator',
             'M365 GDAP Authentication Policy Administrator',
             'M365 GDAP Privileged Role Administrator',
-            'M365 GDAP Privileged Authentication Administrator'
+            'M365 GDAP Privileged Authentication Administrator',
+            'M365 GDAP Billing Administrator',
+            'M365 GDAP Global Reader',
+            'M365 GDAP Domain Name Administrator'
         )
         $RoleAssignableGroups = $SAMUserMemberships | Where-Object { $_.isAssignableToRole }
-        $NestedGroups = foreach ($Group in $RoleAssignableGroups) {
-            Write-Information "Getting nested group memberships for $($Group.displayName)"
-            New-GraphGetRequest -uri "https://graph.microsoft.com/beta/groups/$($Group.id)/memberOf?`$select=id,displayName" -NoAuthCheck $true
+        $NestedGroups = [System.Collections.Generic.List[object]]::new()
+        foreach ($RoleGroup in $RoleAssignableGroups) {
+            Write-Information "Getting nested group memberships for $($RoleGroup.displayName)"
+            $NestedGroups.AddRange(@(New-GraphGetRequest -uri "https://graph.microsoft.com/beta/groups/$($RoleGroup.id)/memberOf?`$select=id,displayName" -NoAuthCheck $true))
         }
-        foreach ($Group in $ExpectedGroups) {
+        foreach ($ExpectedGroup in $ExpectedGroups) {
             $GroupFound = $false
             foreach ($Membership in ($SAMUserMemberships + $NestedGroups)) {
-                if ($Membership.displayName -match $Group) {
-                    Write-Information "Found $Group in group memberships"
+                if ($Membership.displayName -match $ExpectedGroup) {
+                    Write-Information "Found $ExpectedGroup in group memberships"
                     $GroupFound = $true
                 }
             }
             if (-not $GroupFound) {
-                if ($Group -eq 'AdminAgents') { $Type = 'Error' } else { $Type = 'Warning' }
+                if ($ExpectedGroup -eq 'AdminAgents') { $Type = 'Error' } else { $Type = 'Warning' }
                 $GDAPissues.add([PSCustomObject]@{
                         Type         = $Type
-                        Issue        = "$($Group) is not assigned to the SAM user $me. If you have migrated outside of CIPP this is to be expected. Please perform an access check to make sure you have the correct set of permissions."
+                        Issue        = "$($ExpectedGroup) is not assigned to the SAM user $me. If you have migrated outside of CIPP this is to be expected. Please perform an access check to make sure you have the correct set of permissions."
                         Tenant       = '*Partner Tenant'
                         Relationship = 'None'
-                        Link         = 'https://docs.cipp.app/setup/gdap/troubleshooting#groups'
+                        Link         = 'https://docs.cipp.app/setup/installation/recommended-roles'
 
                     }) | Out-Null
                 $MissingGroups.Add([PSCustomObject]@{
-                        Name = $Group
+                        Name = $ExpectedGroup
                         Type = 'SAM User Membership'
                     }) | Out-Null
             }
         }
-        if ($CIPPGroupCount -lt 12) {
+        if ($CIPPGroupCount -lt 15) {
             $GDAPissues.add([PSCustomObject]@{
                     Type         = 'Warning'
-                    Issue        = "We only found $($CIPPGroupCount) of the 12 required groups. If you have migrated outside of CIPP this is to be expected. Please perform an access check to make sure you have the correct set of permissions."
+                    Issue        = "We only found $($CIPPGroupCount) of the 15 required groups. If you have migrated outside of CIPP this is to be expected. Please perform an access check to make sure you have the correct set of permissions."
                     Tenant       = '*Partner Tenant'
                     Relationship = 'None'
-                    Link         = 'https://docs.cipp.app/setup/gdap/troubleshooting#groups'
+                    Link         = 'https://docs.cipp.app/setup/installation/recommended-roles'
 
                 }) | Out-Null
+        }
+
+        # Validate that every stored GDAP role mapping still points at a group that exists in the partner tenant.
+        # A drifted/deleted GroupId is what causes the "access container does not exist" error during onboarding.
+        # Problems are added to GDAPIssues as errors (so they count toward the Errors total) and tagged with
+        # Category 'RoleMapping' so the frontend can keep them out of the GDAP Issues table (the detail/repair view
+        # lives in RoleMappingResults).
+        $RolesTable = Get-CIPPTable -TableName 'GDAPRoles'
+        $StoredRoleMappings = Get-CIPPAzDataTableEntity @RolesTable -Filter "PartitionKey eq 'Roles'"
+        if (($StoredRoleMappings | Measure-Object).Count -gt 0) {
+            # Read-only check: do not write back or recreate groups from the access check card
+            $MappingCheck = Test-CIPPGDAPGroupMappings -RoleMappings $StoredRoleMappings -Headers $Headers
+            $RoleMappingResults.AddRange(@($MappingCheck.Results))
+            foreach ($MappingResult in $MappingCheck.Results) {
+                if ($MappingResult.Status -eq 'Missing') {
+                    $GDAPissues.add([PSCustomObject]@{
+                            Type         = 'Error'
+                            Category     = 'RoleMapping'
+                            Issue        = "The GDAP role mapping for '$($MappingResult.GroupName)' references a security group that no longer exists in the partner tenant. Onboarding group mapping will fail until the GDAP roles are recreated."
+                            Tenant       = '*Partner Tenant'
+                            Relationship = 'None'
+                            Link         = 'https://docs.cipp.app/setup/installation/recommended-roles'
+                        }) | Out-Null
+                } elseif ($MappingResult.Status -eq 'Stale') {
+                    $GDAPissues.add([PSCustomObject]@{
+                            Type         = 'Error'
+                            Category     = 'RoleMapping'
+                            Issue        = "The GDAP role mapping for '$($MappingResult.GroupName)' points at a stale group id but a matching group still exists. Use 'Repair Role Mappings' under Details to correct the stored group id."
+                            Tenant       = '*Partner Tenant'
+                            Relationship = 'None'
+                            Link         = 'https://docs.cipp.app/setup/installation/recommended-roles'
+                        }) | Out-Null
+                }
+            }
         }
 
     } catch {
@@ -101,10 +140,11 @@ function Test-CIPPGDAPRelationships {
     }
 
     $GDAPRelationships = [PSCustomObject]@{
-        GDAPIssues     = @($GDAPissues)
-        MissingGroups  = @($MissingGroups)
-        Memberships    = @($SAMUserMemberships)
-        CIPPGroupCount = $CIPPGroupCount
+        GDAPIssues         = @($GDAPissues)
+        MissingGroups      = @($MissingGroups)
+        Memberships        = @($SAMUserMemberships + $NestedGroups)
+        CIPPGroupCount     = $CIPPGroupCount
+        RoleMappingResults = @($RoleMappingResults)
     }
 
     $Table = Get-CIPPTable -TableName AccessChecks

@@ -38,7 +38,15 @@ function New-CIPPIntuneTemplate {
         }
         'managedAppPolicies' {
             $Type = 'AppProtection'
-            $Template = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/deviceAppManagement/$($urlname)('$($ID)')" -tenantid $TenantFilter
+            $AppProtectionUrl = switch (($ODataType -replace '#microsoft.graph.', '')) {
+                'androidManagedAppProtection' { 'androidManagedAppProtections' }
+                'iosManagedAppProtection' { 'iosManagedAppProtections' }
+                'windowsManagedAppProtection' { 'windowsManagedAppProtections' }
+                'mdmWindowsInformationProtectionPolicy' { 'mdmWindowsInformationProtectionPolicies' }
+                'targetedManagedAppConfiguration' { 'targetedManagedAppConfigurations' }
+                default { 'managedAppPolicies' }
+            }
+            $Template = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/deviceAppManagement/$($AppProtectionUrl)('$($ID)')" -tenantid $TenantFilter
             $DisplayName = $Template.displayName
             $TemplateJson = ConvertTo-Json -InputObject $Template -Depth 100 -Compress
         }
@@ -64,6 +72,13 @@ function New-CIPPIntuneTemplate {
         'deviceConfigurations' {
             $Type = 'Device'
             $Template = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/deviceManagement/$($urlname)/$($ID)" -tenantid $TenantFilter | Select-Object * -ExcludeProperty id, lastModifiedDateTime, '@odata.context', 'ScopeTagIds', 'supportsScopeTags', 'createdDateTime'
+
+            # Check for and decrypt encrypted OMA settings
+            if ($Template.omaSettings) {
+                Write-Information "Checking for encrypted OMA settings in policy: $($Template.displayName)"
+                $Template = Get-CIPPOmaSettingDecryptedValue -DeviceConfiguration $Template -DeviceConfigurationId $ID -TenantFilter $TenantFilter
+            }
+
             $DisplayName = $Template.displayName
             $TemplateJson = ConvertTo-Json -InputObject $Template -Depth 100 -Compress
         }

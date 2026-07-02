@@ -6,7 +6,8 @@ function New-CIPPCATemplate {
         $APIName = 'Add CIPP CA Template',
         $Headers,
         $preloadedUsers,
-        $preloadedGroups
+        $preloadedGroups,
+        $preloadedLocations
     )
 
     $JSON = ([pscustomobject]$JSON) | ForEach-Object {
@@ -16,11 +17,6 @@ function New-CIPPCATemplate {
 
     Write-Information "Processing CA Template for tenant $TenantFilter"
     Write-Information ($JSON | ConvertTo-Json -Depth 10)
-
-    # Function to check if a string is a GUID
-    function Test-IsGuid($string) {
-        return [guid]::tryparse($string, [ref][guid]::Empty)
-    }
 
     if ($preloadedUsers) {
         $users = $preloadedUsers
@@ -34,8 +30,18 @@ function New-CIPPCATemplate {
     }
 
     $namedLocations = $null
-    if ($JSON.conditions.locations.includeLocations -or $JSON.conditions.locations.excludeLocations) {
-        $namedLocations = New-GraphGetRequest -uri 'https://graph.microsoft.com/beta/identity/conditionalAccess/namedLocations' -tenantid $TenantFilter
+    if ($preloadedLocations) {
+        $namedLocations = $preloadedLocations
+    } else {
+        if ($JSON.conditions.locations.includeLocations -or $JSON.conditions.locations.excludeLocations) {
+            $namedLocations = New-GraphGetRequest -uri 'https://graph.microsoft.com/beta/identity/conditionalAccess/namedLocations?$top=999' -tenantid $TenantFilter
+        }
+    }
+
+    # Fetch authentication context class references if the policy uses them
+    $authContexts = $null
+    if ($JSON.conditions.applications.includeAuthenticationContextClassReferences) {
+        $authContexts = New-GraphGetRequest -uri 'https://graph.microsoft.com/beta/identity/conditionalAccess/authenticationContextClassReferences' -tenantid $TenantFilter
     }
 
     $AllLocations = [system.collections.generic.list[object]]::new()
@@ -46,7 +52,9 @@ function New-CIPPCATemplate {
         $null = if ($locationinfo) { $includelocations.add($locationinfo.displayName) } else { $includelocations.add($location) }
         $locationinfo
     }
-    if ($includelocations) { $JSON.conditions.locations.includeLocations = $includelocations }
+    if ($includelocations) {
+        $JSON.conditions.locations | Add-Member -NotePropertyName 'includeLocations' -NotePropertyValue $includelocations -Force
+    }
 
     $excludelocations = [system.collections.generic.list[object]]::new()
     $ExcludeJSON = foreach ($Location in $JSON.conditions.locations.excludeLocations) {
@@ -55,7 +63,9 @@ function New-CIPPCATemplate {
         $locationinfo
     }
 
-    if ($excludelocations) { $JSON.conditions.locations.excludeLocations = $excludelocations }
+    if ($excludelocations) {
+        $JSON.conditions.locations | Add-Member -NotePropertyName 'excludeLocations' -NotePropertyValue $excludelocations -Force
+    }
     # Check if conditions.users exists and is a PSCustomObject (not an array) before accessing properties
     $hasConditionsUsers = $null -ne $JSON.conditions.users
     # Explicitly exclude array types - arrays have properties but we can't set custom properties on them
@@ -85,7 +95,7 @@ function New-CIPPCATemplate {
     if ($isPSCustomObject -and $null -ne $JSON.conditions.users.includeGroups) {
         $JSON.conditions.users.includeGroups = @($JSON.conditions.users.includeGroups | ForEach-Object {
                 $originalID = $_
-                if ($_ -in 'All', 'None', 'GuestOrExternalUsers' -or -not (Test-IsGuid $_)) { return $_ }
+                if ($_ -in 'All', 'None', 'GuestOrExternalUsers' -or -not (Test-IsGuid -String $_)) { return $_ }
                 $match = $groups | Where-Object { $_.id -eq $originalID }
                 if ($match) { $match.displayName } else { $originalID }
             })
@@ -93,7 +103,7 @@ function New-CIPPCATemplate {
     if ($isPSCustomObject -and $null -ne $JSON.conditions.users.excludeGroups) {
         $JSON.conditions.users.excludeGroups = @($JSON.conditions.users.excludeGroups | ForEach-Object {
                 $originalID = $_
-                if ($_ -in 'All', 'None', 'GuestOrExternalUsers' -or -not (Test-IsGuid $_)) { return $_ }
+                if ($_ -in 'All', 'None', 'GuestOrExternalUsers' -or -not (Test-IsGuid -String $_)) { return $_ }
                 $match = $groups | Where-Object { $_.id -eq $originalID }
                 if ($match) { $match.displayName } else { $originalID }
             })
@@ -109,6 +119,24 @@ function New-CIPPCATemplate {
     # Remove duplicates based on displayName to avoid Select-Object -Unique issues with complex objects
     $UniqueLocations = $AllLocations | Group-Object -Property displayName | ForEach-Object { $_.Group[0] }
     $JSON | Add-Member -NotePropertyName 'LocationInfo' -NotePropertyValue @($UniqueLocations) -Force
+
+    # Convert authentication context class reference IDs to display names and store full objects
+    if ($authContexts -and $JSON.conditions.applications.includeAuthenticationContextClassReferences) {
+        $AllAuthContexts = [System.Collections.Generic.List[object]]::new()
+        $authContextDisplayNames = [System.Collections.Generic.List[object]]::new()
+        foreach ($acr in $JSON.conditions.applications.includeAuthenticationContextClassReferences) {
+            $acrInfo = $authContexts | Where-Object -Property id -EQ $acr | Select-Object id, displayName, description, isAvailable
+            if ($acrInfo) {
+                $authContextDisplayNames.Add($acrInfo.displayName)
+                $AllAuthContexts.Add($acrInfo)
+            } else {
+                $authContextDisplayNames.Add($acr)
+            }
+        }
+        $JSON.conditions.applications.includeAuthenticationContextClassReferences = @($authContextDisplayNames)
+        $JSON | Add-Member -NotePropertyName 'AuthContextInfo' -NotePropertyValue @($AllAuthContexts) -Force
+    }
+
     $JSON = (ConvertTo-Json -Compress -Depth 100 -InputObject $JSON)
     return $JSON
 }

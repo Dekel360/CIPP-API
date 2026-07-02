@@ -12,11 +12,26 @@ function Get-CIPPTextReplacement {
         Get-CIPPTextReplacement -TenantFilter 'contoso.com' -Text 'Hello %tenantname%'
     #>
     param (
-        [string]$TenantFilter,
+        [string]$TenantFilter = $env:TenantID,
         $Text,
         [switch]$EscapeForJson
     )
+    # Escapes a replacement value so it can be safely spliced into a serialized JSON
+    # string literal. Handles quotes, backslashes, newlines, tabs and control chars.
+    function ConvertTo-CIPPJsonEscapedString {
+        param($Value)
+        if ($null -eq $Value) { return '' }
+        $Encoded = [string]$Value | ConvertTo-Json -Compress
+        # Strip the surrounding quotes ConvertTo-Json adds, leaving just the escaped body.
+        return $Encoded.Substring(1, $Encoded.Length - 2)
+    }
+
     if ($Text -isnot [string]) {
+        return , $Text
+    }
+
+    # Without a tenant context, skip replacement lookups and return input as-is.
+    if ([string]::IsNullOrWhiteSpace($TenantFilter)) {
         return $Text
     }
 
@@ -24,6 +39,8 @@ function Get-CIPPTextReplacement {
         '%serial%',
         '%systemroot%',
         '%systemdrive%',
+        '%system32%',
+        '%osdrive%',
         '%temp%',
         '%tenantid%',
         '%tenantfilter%',
@@ -44,8 +61,12 @@ function Get-CIPPTextReplacement {
         '%organizationid%'
     )
 
-    $Tenant = Get-Tenants -TenantFilter $TenantFilter
-    $CustomerId = $Tenant.customerId
+    if ($TenantFilter -ne $env:TenantID) {
+        $Tenant = Get-Tenants -TenantFilter $TenantFilter
+        $CustomerId = $Tenant.customerId
+    } else {
+        $CustomerId = $TenantFilter
+    }
 
     #connect to table, get replacement map. The replacement map will allow users to create custom vars that get replaced by the actual values per tenant. Example:
     # %WallPaperPath% gets replaced by RowKey WallPaperPath which is set to C:\Wallpapers for tenant 1, and D:\Wallpapers for tenant 2
@@ -56,11 +77,12 @@ function Get-CIPPTextReplacement {
     $Vars = @{}
     if ($GlobalMap) {
         foreach ($Var in $GlobalMap) {
+            if (-not $Var.PSObject.Properties['Value']) { continue }
+            $Val = $Var.Value
             if ($EscapeForJson.IsPresent) {
-                # Escape quotes for JSON if not already escaped
-                $Var.Value = $Var.Value -replace '(?<!\\)"', '\"'
+                $Val = ConvertTo-CIPPJsonEscapedString -Value $Val
             }
-            $Vars[$Var.RowKey] = $Var.Value
+            $Vars[$Var.RowKey] = $Val
         }
     }
 
@@ -73,11 +95,12 @@ function Get-CIPPTextReplacement {
         }
         if ($ReplaceMap) {
             foreach ($Var in $ReplaceMap) {
+                if (-not $Var.PSObject.Properties['Value']) { continue }
+                $Val = $Var.Value
                 if ($EscapeForJson.IsPresent) {
-                    # Escape quotes for JSON if not already escaped
-                    $Var.Value = $Var.Value -replace '(?<!\\)"', '\"'
+                    $Val = ConvertTo-CIPPJsonEscapedString -Value $Val
                 }
-                $Vars[$Var.RowKey] = $Var.Value
+                $Vars[$Var.RowKey] = $Val
             }
         }
     }

@@ -13,24 +13,37 @@ function Test-CIPPRerun {
     )
     $RerunTable = Get-CIPPTable -tablename 'RerunCache'
 
-    # Use custom interval if provided, otherwise use type-based defaults
-    if ($Interval -gt 0) {
-        $EstimatedDifference = $Interval
-    } else {
-        $EstimatedDifference = switch ($Type) {
-            'Standard' { 9800 } # 2 hours 45 minutes ish.
-            'BPA' { 85000 } # 24 hours ish.
-            'CippTests' { 85000 } # 24 hours ish.
-            default { throw "Unknown type: $Type" }
+    if (!$ClearAll.IsPresent -and !$Clear.IsPresent) {
+        # Use custom interval if provided, otherwise use type-based defaults
+        if ($Interval -gt 0) {
+            $EstimatedDifference = $Interval
+        } else {
+            $EstimatedDifference = switch ($Type) {
+                'Standard' { 9800 } # 2 hours 45 minutes ish.
+                'BPA' { 85000 } # 24 hours ish.
+                'CippTests' { 85000 } # 24 hours ish.
+                'ExchangeMonitor' { 3500 } #about an hour
+                default { throw "Unknown type: $Type" }
+            }
         }
     }
 
-    # Use BaseTime if provided, otherwise use current time
-    $CurrentUnixTime = if ($BaseTime -gt 0) { $BaseTime } else { [int][double]::Parse((Get-Date -UFormat %s)) }
-    $EstimatedNextRun = $CurrentUnixTime + $EstimatedDifference
+    # Real wall-clock time, used to decide whether enough time has actually elapsed to allow a rerun.
+    $Now = [int64](([datetime]::UtcNow) - (Get-Date '1/1/1970')).TotalSeconds
+    # Anchor time for *recording* the next run. For scheduled tasks we anchor to the task's
+    # ScheduledTime (BaseTime) so EstimatedNextRun aligns to the schedule; otherwise use now.
+    $AnchorTime = if ($BaseTime -gt 0) { $BaseTime } else { $Now }
+    $EstimatedNextRun = $AnchorTime + $EstimatedDifference
 
     try {
-        $RerunData = Get-CIPPAzDataTableEntity @RerunTable -filter "PartitionKey eq '$($TenantFilter)'" | Where-Object { $_.RowKey -match "^$($Type)_$($API)" }
+        $Filters = [System.Collections.Generic.List[string]]::new()
+        if ($TenantFilter -ne 'AllTenants') {
+            $Filters.Add("PartitionKey eq '$TenantFilter'")
+        }
+        $Filters.Add("RowKey ge '$($Type)_$($API)' and RowKey le '$($Type)_$($API)~'") # ~ is the highest ASCII character, this ensures we only get entries for this API.
+        $FilterString = [string]::Join(' and ', $Filters)
+
+        $RerunData = Get-CIPPAzDataTableEntity @RerunTable -filter $FilterString
         if ($ClearAll.IsPresent) {
             $AllRerunData = Get-CIPPAzDataTableEntity @RerunTable
             if ($AllRerunData) {
@@ -52,28 +65,41 @@ function Test-CIPPRerun {
                 $NewSettings = $($Settings | ConvertTo-Json -Depth 10 -Compress)
                 if ($NewSettings.Length -ne $PreviousSettings.Length) {
                     Write-Host "$($NewSettings.Length) vs $($PreviousSettings.Length) - settings have changed."
-                    $RerunData.EstimatedNextRun = $EstimatedNextRun
-                    $RerunData.Settings = "$($Settings | ConvertTo-Json -Depth 10 -Compress)"
+                    $RerunData | Add-Member -MemberType NoteProperty -Name 'EstimatedNextRun' -Value $EstimatedNextRun -Force
+                    $RerunData | Add-Member -MemberType NoteProperty -Name 'LastScheduledTime' -Value "$AnchorTime" -Force
+                    $RerunData | Add-Member -MemberType NoteProperty -Name 'Settings' -Value "$($Settings | ConvertTo-Json -Depth 10 -Compress)" -Force
                     Add-CIPPAzDataTableEntity @RerunTable -Entity $RerunData -Force
                     return $false # Not a rerun because settings have changed.
                 }
             }
-            if ($RerunData.EstimatedNextRun -gt $CurrentUnixTime) {
-                Write-LogMessage -API $API -message "Standard rerun detected for $($API). Prevented from running again." -tenant $TenantFilter -headers $Headers -Sev 'Info'
+            # If the task was rescheduled (ScheduledTime changed since last cache write),
+            # treat it as a new execution rather than a duplicate.
+            if ($BaseTime -gt 0 -and $RerunData.LastScheduledTime -and [int64]$RerunData.LastScheduledTime -ne $BaseTime) {
+                Write-Information "Task $API has a new ScheduledTime ($BaseTime vs cached $($RerunData.LastScheduledTime)). Treating as new execution."
+                $RerunData | Add-Member -MemberType NoteProperty -Name 'EstimatedNextRun' -Value $EstimatedNextRun -Force
+                $RerunData | Add-Member -MemberType NoteProperty -Name 'LastScheduledTime' -Value "$BaseTime" -Force
+                $RerunData | Add-Member -MemberType NoteProperty -Name 'Settings' -Value "$($Settings | ConvertTo-Json -Depth 10 -Compress)" -Force
+                Add-CIPPAzDataTableEntity @RerunTable -Entity $RerunData -Force
+                return $false
+            }
+            if ($RerunData.EstimatedNextRun -gt $Now) {
+                Write-LogMessage -API $API -message "$Type rerun detected for $($API). Prevented from running again." -tenant $TenantFilter -headers $Headers -Sev 'Info'
                 return $true
             } else {
-                $RerunData.EstimatedNextRun = $EstimatedNextRun
-                $RerunData.Settings = "$($Settings | ConvertTo-Json -Depth 10 -Compress)"
+                $RerunData | Add-Member -MemberType NoteProperty -Name 'EstimatedNextRun' -Value $EstimatedNextRun -Force
+                $RerunData | Add-Member -MemberType NoteProperty -Name 'LastScheduledTime' -Value "$AnchorTime" -Force
+                $RerunData | Add-Member -MemberType NoteProperty -Name 'Settings' -Value "$($Settings | ConvertTo-Json -Depth 10 -Compress)" -Force
                 Add-CIPPAzDataTableEntity @RerunTable -Entity $RerunData -Force
                 return $false
             }
         } else {
-            $EstimatedNextRun = $CurrentUnixTime + $EstimatedDifference
+            $EstimatedNextRun = $AnchorTime + $EstimatedDifference
             $NewEntity = @{
-                PartitionKey     = "$TenantFilter"
-                RowKey           = "$($Type)_$($API)"
-                Settings         = "$($Settings | ConvertTo-Json -Depth 10 -Compress)"
-                EstimatedNextRun = $EstimatedNextRun
+                PartitionKey      = "$TenantFilter"
+                RowKey            = "$($Type)_$($API)"
+                Settings          = "$($Settings | ConvertTo-Json -Depth 10 -Compress)"
+                EstimatedNextRun  = $EstimatedNextRun
+                LastScheduledTime = "$AnchorTime"
             }
             Add-CIPPAzDataTableEntity @RerunTable -Entity $NewEntity -Force
             return $false
@@ -81,7 +107,7 @@ function Test-CIPPRerun {
     } catch {
         $ErrorMessage = Get-CippException -Exception $_
         Write-Host "Could not detect if this is a rerun: $($ErrorMessage.NormalizedError)"
-        Write-LogMessage -headers $Headers -API $API -message "Could not detect if this is a rerun: $($ErrorMessage.NormalizedError)" -Sev 'Error' -LogData (Get-CippException -Exception $_)
+        Write-LogMessage -headers $Headers -API $API -message "Could not detect if this is a rerun: $($ErrorMessage.NormalizedError)" -Sev 'Error' -LogData $ErrorMessage
         return $false
     }
 }

@@ -7,9 +7,11 @@ function Get-CIPPAzDataTableEntity {
         $First,
         $Skip,
         $Sort,
-        $Count
+        $Count,
+        [int]$MaxRetries = 3
     )
 
+    $PSBoundParameters['MaxRetries'] = $MaxRetries
     $Results = Get-AzDataTableEntity @PSBoundParameters
     $mergedResults = @{}
     $rootEntities = @{} # Keyed by "$PartitionKey|$RowKey"
@@ -81,16 +83,21 @@ function Get-CIPPAzDataTableEntity {
 
     foreach ($entity in $finalResults) {
         if ($entity.SplitOverProps) {
-            $splitInfoList = $entity.SplitOverProps | ConvertFrom-Json
-            foreach ($splitInfo in $splitInfoList) {
-                $mergedData = [string]::Join('', ($splitInfo.SplitHeaders | ForEach-Object { $entity.$_ }))
-                $entity | Add-Member -NotePropertyName $splitInfo.OriginalHeader -NotePropertyValue $mergedData -Force
-                $propsToRemove = $splitInfo.SplitHeaders
-                foreach ($prop in $propsToRemove) {
-                    $entity.PSObject.Properties.Remove($prop)
+            try {
+                $splitInfoList = $entity.SplitOverProps | ConvertFrom-Json -ErrorAction Stop
+                foreach ($splitInfo in $splitInfoList) {
+                    $mergedData = [string]::Join('', ($splitInfo.SplitHeaders | ForEach-Object { $entity.$_ }))
+                    $entity | Add-Member -NotePropertyName $splitInfo.OriginalHeader -NotePropertyValue $mergedData -Force
+                    $propsToRemove = $splitInfo.SplitHeaders
+                    foreach ($prop in $propsToRemove) {
+                        $entity.PSObject.Properties.Remove($prop)
+                    }
                 }
+            } catch {
+                Write-Warning "Failed to process SplitOverProps for entity with PartitionKey='$($entity.PartitionKey)' and RowKey='$($entity.RowKey)': $($_.Exception.Message)"
+            } finally {
+                $entity.PSObject.Properties.Remove('SplitOverProps')
             }
-            $entity.PSObject.Properties.Remove('SplitOverProps')
         }
     }
 
