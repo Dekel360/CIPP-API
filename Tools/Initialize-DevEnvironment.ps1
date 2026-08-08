@@ -1,18 +1,28 @@
+Write-Host 'Initializing development environment...' -ForegroundColor Green
 $CippRoot = (Get-Item $PSScriptRoot).Parent.FullName
+$env:CIPPRootPath = $CippRoot
 ### Read the local.settings.json file and convert to a PowerShell object.
 $CIPPSettings = Get-Content (Join-Path $CippRoot 'local.settings.json') | ConvertFrom-Json | Select-Object -ExpandProperty Values
 ### Loop through the settings and set environment variables for each.
-$ValidKeys = @('TenantID', 'ApplicationID', 'ApplicationSecret', 'RefreshToken', 'AzureWebJobsStorage', 'PartnerTenantAvailable', 'SetFromProfile')
+$ValidKeys = @('AzureWebJobsStorage', 'PartnerTenantAvailable', 'SetFromProfile')
 foreach ($Key in $CIPPSettings.PSObject.Properties.Name) {
     if ($ValidKeys -contains $Key) {
         [Environment]::SetEnvironmentVariable($Key, $CippSettings.$Key)
     }
 }
 
-$PowerShellWorkerRoot = Join-Path $env:ProgramFiles 'Microsoft\Azure Functions Core Tools\workers\powershell\7.4\Microsoft.Azure.Functions.PowerShellWorker.dll'
-if ((Test-Path $PowerShellWorkerRoot) -and !('Microsoft.Azure.Functions.PowerShellWorker' -as [type])) {
-    Write-Information "Loading PowerShell Worker from $PowerShellWorkerRoot"
-    Add-Type -Path $PowerShellWorkerRoot
+# if windows
+if ($IsWindows) {
+    $PowerShellWorkerRoot = Join-Path $env:ProgramFiles 'Microsoft\Azure Functions Core Tools\workers\powershell\7.4\Microsoft.Azure.Functions.PowerShellWorker.dll'
+    if ((Test-Path $PowerShellWorkerRoot) -and !('Microsoft.Azure.Functions.PowerShellWorker' -as [type])) {
+        Write-Information "Loading PowerShell Worker from $PowerShellWorkerRoot"
+        Add-Type -Path $PowerShellWorkerRoot
+    }
+}
+
+$CIPPSharpDllPath = Join-Path $CippRoot 'Shared\CIPPSharp\bin\CIPPSharp.dll'
+if ((Test-Path $CIPPSharpDllPath) -and !('CIPP.CIPPRestClient' -as [type])) {
+    [Reflection.Assembly]::LoadFile($CIPPSharpDllPath) | Out-Null
 }
 
 # Remove previously loaded modules to force reloading if new code changes were made
@@ -28,4 +38,9 @@ Import-Module ( Join-Path $CippRoot 'Modules\DNSHealth' )
 Import-Module ( Join-Path $CippRoot 'Modules\CIPPCore' )
 Import-Module ( Join-Path $CippRoot 'Modules\CippExtensions' )
 
-Get-CIPPAuthentication
+$Auth = Get-CIPPAuthentication
+if ($Auth) {
+    Write-Host 'Development environment initialized successfully!' -ForegroundColor Green
+} else {
+    Write-Host 'Failed to initialize development environment. Please check the error messages above.' -ForegroundColor Red
+}

@@ -1,29 +1,28 @@
 function Add-CIPPScheduledTask {
-    [CmdletBinding(DefaultParameterSetName = 'Default')]
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true, ParameterSetName = 'Default')]
+        [Parameter(Mandatory = $false)]
         [pscustomobject]$Task,
 
-        [Parameter(Mandatory = $false, ParameterSetName = 'Default')]
+        [Parameter(Mandatory = $false)]
         [bool]$Hidden,
 
-        [Parameter(Mandatory = $false, ParameterSetName = 'Default')]
+        [Parameter(Mandatory = $false)]
         $DisallowDuplicateName = $false,
 
-        [Parameter(Mandatory = $false, ParameterSetName = 'Default')]
+        [Parameter(Mandatory = $false)]
         [string]$SyncType = $null,
 
-        [Parameter(Mandatory = $false, ParameterSetName = 'RunNow')]
+        [Parameter(Mandatory = $false)]
         [switch]$RunNow,
 
-        [Parameter(Mandatory = $true, ParameterSetName = 'RunNow')]
-        [string]$RowKey,
+        [Parameter(Mandatory = $false)]
+        [string]$RowKey = $null,
 
-        [Parameter(Mandatory = $false, ParameterSetName = 'Default')]
+        [Parameter(Mandatory = $false)]
         [string]$DesiredStartTime = $null,
 
-        [Parameter(Mandatory = $false, ParameterSetName = 'Default')]
-        [Parameter(Mandatory = $false, ParameterSetName = 'RunNow')]
+        [Parameter(Mandatory = $false)]
         $Headers
     )
 
@@ -39,6 +38,9 @@ function Add-CIPPScheduledTask {
                 $ExistingTask.TaskState = 'Planned'
                 Add-CIPPAzDataTableEntity @Table -Entity $ExistingTask -Force
                 Write-LogMessage -headers $Headers -API 'RunNow' -message "Task $($ExistingTask.Name) scheduled to run now" -Sev 'Info' -Tenant $ExistingTask.Tenant
+                Add-CippQueueMessage -Cmdlet 'Start-UserTasksOrchestrator' -Parameters @{
+                    TaskId = $RowKey
+                }
                 return "Task $($ExistingTask.Name) scheduled to run now"
             } catch {
                 $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
@@ -58,6 +60,45 @@ function Add-CIPPScheduledTask {
                 if ($ExistingTask) {
                     return "Task with name $($Task.Name) already exists"
                 }
+            }
+
+            $RequestedCommand = $task.Command.value ?? $task.Command
+
+            # Validate the command exists — on HttpOnly workers sibling modules aren't loaded,
+            # so import them temporarily for validation (actual execution runs on activity workers)
+            $Command = Get-Command $RequestedCommand -ErrorAction SilentlyContinue
+            $ImportedModules = [System.Collections.Generic.List[string]]::new()
+            if (-not $Command) {
+                try {
+                    foreach ($SiblingModule in @('CIPPStandards', 'CIPPAlerts', 'CIPPTests', 'CIPPDB', 'CippExtensions', 'CIPPActivityTriggers')) {
+                        if (-not (Get-Module -Name $SiblingModule)) {
+                            Import-Module $SiblingModule -ErrorAction SilentlyContinue
+                            if (Get-Module -Name $SiblingModule) {
+                                $ImportedModules.Add($SiblingModule)
+                            }
+                        }
+                    }
+                    $Command = Get-Command $RequestedCommand -ErrorAction SilentlyContinue
+                } finally {
+                    foreach ($Imported in $ImportedModules) {
+                        Remove-Module $Imported -ErrorAction SilentlyContinue
+                    }
+                }
+            }
+
+            if (!$Command) {
+                Write-LogMessage -headers $Headers -API 'ScheduledTask' -message "Blocked attempt to schedule non-existent command: $RequestedCommand" -Sev 'Warning'
+                return "Error - The command '$RequestedCommand' does not exist and cannot be scheduled."
+            }
+
+            if ($Command.Module -notin @('CIPPCore', 'CIPPAlerts', 'CIPPStandards', 'CIPPTests', 'CIPPDB', 'CippExtensions', 'CIPPActivityTriggers')) {
+                Write-LogMessage -headers $Headers -API 'ScheduledTask' -message "Blocked attempt to schedule command from unauthorized module: $($Command.ModuleName)\$RequestedCommand" -Sev 'Warning'
+                return "Error - The command '$RequestedCommand' is not permitted to run as a scheduled task."
+            }
+
+            if ($RequestedCommand -in (Get-CIPPSchedulerBlockedCommands)) {
+                Write-LogMessage -headers $Headers -API 'ScheduledTask' -message "Blocked attempt to schedule restricted command: $RequestedCommand" -Sev 'Warning'
+                return "Error - The command '$RequestedCommand' is not permitted to run as a scheduled task."
             }
 
             $propertiesToCheck = @('Webhook', 'Email', 'PSA')
@@ -147,8 +188,15 @@ function Add-CIPPScheduledTask {
                     $task.ScheduledTime = [int64](([datetime]::UtcNow) - (Get-Date '1/1/1970')).TotalSeconds
                 }
             }
-            $excludedTenants = if ($task.excludedTenants.value) {
-                $task.excludedTenants.value -join ','
+            # Split exclusions by type (same pattern as Tenant/TenantGroup): plain tenants are
+            # comma-joined, groups are stored as JSON and expanded at runtime by the orchestrator
+            $ExcludedEntries = @($task.excludedTenants | Where-Object { $_.value })
+            $excludedTenants = @($ExcludedEntries | Where-Object { $_.type -ne 'Group' }).value -join ','
+            $ExcludedGroupEntries = @($ExcludedEntries | Where-Object { $_.type -eq 'Group' } | ForEach-Object {
+                    [PSCustomObject]@{ value = $_.value; label = $_.label; type = 'Group' }
+                })
+            $excludedTenantGroups = if ($ExcludedGroupEntries.Count -gt 0) {
+                ConvertTo-Json -InputObject $ExcludedGroupEntries -Compress -Depth 5
             }
 
             # Handle tenant filter - support both single tenant and tenant groups
@@ -181,8 +229,9 @@ function Add-CIPPScheduledTask {
                 RowKey               = [string]$RowKey
                 Tenant               = [string]$tenantFilter
                 excludedTenants      = [string]$excludedTenants
+                excludedTenantGroups = [string]$excludedTenantGroups
                 Name                 = [string]$task.Name
-                Command              = [string]$task.Command.value
+                Command              = [string]$RequestedCommand
                 Parameters           = [string]$Parameters
                 ScheduledTime        = [string]$task.ScheduledTime
                 Recurrence           = [string]$Recurrence
@@ -192,8 +241,14 @@ function Add-CIPPScheduledTask {
                 Hidden               = [bool]$Hidden
                 Results              = 'Planned'
                 AlertComment         = [string]$task.AlertComment
+                CustomSubject        = [string]$task.CustomSubject
+                PsaTicketStrategy    = [string]($task.PsaTicketStrategy.value ?? $task.PsaTicketStrategy)
             }
 
+
+            if ($task.Tag) {
+                $entity['Tag'] = [string]$task.Tag
+            }
 
             # Always store DesiredStartTime if provided
             if ($DesiredStartTime) {
@@ -297,6 +352,13 @@ function Add-CIPPScheduledTask {
                 { $_ -ge 2 } { "about $([Math]::Round($_)) minutes"; break }
                 { $_ -ge 1 } { 'about 1 minute'; break }
                 default { 'less than a minute' }
+            }
+
+            if ($RunNow.IsPresent) {
+                Add-CippQueueMessage -Cmdlet 'Start-UserTasksOrchestrator' -Parameters @{
+                    TaskId = $RowKey
+                }
+                return "Task $($entity.Name) scheduled to run now"
             }
 
             return "Successfully added task: $($entity.Name). It will run in $relativeTime."

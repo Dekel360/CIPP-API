@@ -11,7 +11,7 @@ function Remove-CIPPCache {
     $Filter = "PartitionKey eq 'Tenants' and Excluded eq false and delegatedPrivilegeStatus eq 'granularDelegatedAdminPrivileges'"
     $ClearIncludedTenants = Get-CIPPAzDataTableEntity @TenantsTable -Filter $Filter -Property PartitionKey, RowKey
     if ($ClearIncludedTenants) {
-        Remove-AzDataTableEntity -Force @TenantsTable -Entity $ClearIncludedTenants
+        Remove-CIPPAzDataTableEntity -Force @TenantsTable -Entity $ClearIncludedTenants
     }
     "Removed $($ClearIncludedTenants.Count) tenants"
 
@@ -26,6 +26,10 @@ function Remove-CIPPCache {
                 Remove-AzDataTable @TableContext
             }
         }
+
+        'Clearing Intune policy tracking data'
+        $TrackingTableContext = Get-CIPPTable -TableName 'IntunePolicyTypeTracking'
+        Remove-AzDataTable @TrackingTableContext
 
         'Clearing domain analyser results'
         # Remove Domain Analyser cached results

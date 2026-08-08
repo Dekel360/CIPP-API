@@ -2,122 +2,148 @@ function Add-CIPPDbItem {
     <#
     .SYNOPSIS
         Add items to the CIPP Reporting database
+    .FUNCTIONALITY
+        Internal
 
-    .DESCRIPTION
-        Adds items to the CippReportingDB table with support for bulk inserts and count mode
-
-    .PARAMETER TenantFilter
-        The tenant domain or GUID (used as partition key)
-
-    .PARAMETER Type
-        The type of data being stored (used in row key)
-
-    .PARAMETER Data
-        Array of items to add to the database
-
-    .PARAMETER Count
-        If specified, stores a single row with count of each object property as separate properties
-
-    .EXAMPLE
-        Add-CIPPDbItem -TenantFilter 'contoso.onmicrosoft.com' -Type 'Groups' -Data $GroupsData
-
-    .EXAMPLE
-        Add-CIPPDbItem -TenantFilter 'contoso.onmicrosoft.com' -Type 'Groups' -Data $GroupsData -Count
+    .PARAMETER ClearOnEmpty
+        Authorizes removal of existing rows when InputObject is an authoritative empty
+        collection and exact row-key cleanup for a non-empty authoritative collection.
+        Callers must only use this after a successful source response.
     #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
         [string]$TenantFilter,
 
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory)]
         [string]$Type,
 
-        [Parameter(Mandatory = $true)]
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [Alias('Data')]
+        [AllowNull()]
         [AllowEmptyCollection()]
-        [array]$Data,
+        $InputObject,
 
-        [Parameter(Mandatory = $false)]
-        [switch]$Count
+        [switch]$Count,
+        [switch]$AddCount,
+        [switch]$Append,
+        [switch]$ClearOnEmpty,
+
+        [ValidateRange(0, 60)]
+        [int]$SkewMarginMinutes = 5
     )
 
-    try {
+    begin {
         $Table = Get-CippTable -tablename 'CippReportingDB'
+        $BatchSize = 100
+        $Batch = [System.Collections.Generic.List[hashtable]]::new($BatchSize)
+        # Track batch duplicates separately from the full authoritative run used for cleanup.
+        $SeenInBatch = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $SeenRowKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        # Allow for storage timestamp lag before considering untouched rows stale.
+        $RunStartUtc = [DateTimeOffset]::UtcNow.AddMinutes(-$SkewMarginMinutes)
 
-        # Helper function to format RowKey values by removing disallowed characters
-        function Format-RowKey {
-            param([string]$RowKey)
+        $TotalProcessed = 0
+        # Cache regex instances so each row pays only the match cost, not regex compilation.
+        # Two passes preserve the original semantics: path/wildcard chars → '_', control chars → stripped.
+        $RowKeyPathRegex = [regex]::new('[/\\#?]')
+        $RowKeyControlRegex = [regex]::new('[\u0000-\u001F\u007F-\u009F]')
 
-            # Remove disallowed characters: / \ # ? and control characters (U+0000 to U+001F and U+007F to U+009F)
-            $sanitized = $RowKey -replace '[/\\#?]', '_' -replace '[\u0000-\u001F\u007F-\u009F]', ''
+        if ($TenantFilter -match '^[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}$') {
+            try {
+                $TenantLookup = @(Get-Tenants -TenantFilter $TenantFilter -IncludeErrors)
+                if ($TenantLookup.Count -gt 0) { $TenantFilter = $TenantLookup[0].defaultDomainName }
+            } catch {}
+        }
+    }
 
-            return $sanitized
+    process {
+        if ($null -eq $InputObject) { return }
+
+        if ($Count.IsPresent) {
+            if ($InputObject -is [int]) { $TotalProcessed = $InputObject } else { $TotalProcessed += @($InputObject).Count }
+            return
         }
 
-        if ($Count) {
-            $Entity = @{
-                PartitionKey = $TenantFilter
-                RowKey       = Format-RowKey "$Type-Count"
-                DataCount    = [int]$Data.Count
-            }
-
-            Add-CIPPAzDataTableEntity @Table -Entity $Entity -Force | Out-Null
-
-        } else {
-            #Get the existing type entries and nuke them. This ensures we don't have stale data.
-            $Filter = "PartitionKey eq '{0}' and RowKey ge '{1}-' and RowKey lt '{1}0'" -f $TenantFilter, $Type
-            $ExistingEntities = Get-CIPPAzDataTableEntity @Table -Filter $Filter
-            if ($ExistingEntities) {
-                Remove-AzDataTableEntity @Table -Entity $ExistingEntities -Force | Out-Null
-            }
-
-            # Calculate batch size based on available memory
-            $AvailableMemory = [System.GC]::GetTotalMemory($false)
-            $AvailableMemoryMB = [math]::Round($AvailableMemory / 1MB, 2)
-
-            # Estimate item size from first item (with fallback)
-            $EstimatedItemSizeBytes = 1KB # Default assumption
-            if ($Data.Count -gt 0) {
-                $SampleJson = $Data[0] | ConvertTo-Json -Depth 10 -Compress
-                $EstimatedItemSizeBytes = [System.Text.Encoding]::UTF8.GetByteCount($SampleJson)
-            }
-
-            # Use 25% of available memory for batch processing, with min/max bounds
-            $TargetBatchMemoryMB = [Math]::Max(50, $AvailableMemoryMB * 0.25)
-            $CalculatedBatchSize = [Math]::Floor(($TargetBatchMemoryMB * 1MB) / $EstimatedItemSizeBytes)
-            # Reduce max to 500 to prevent OOM with large datasets
-            $BatchSize = [Math]::Max(100, [Math]::Min(500, $CalculatedBatchSize))
-
-            $TotalCount = $Data.Count
-            $ProcessedCount = 0
-            Write-Information "Adding $TotalCount items of type $Type to CIPP Reporting DB for tenant $TenantFilter | Available Memory: ${AvailableMemoryMB}MB | Target Memory: ${TargetBatchMemoryMB}MB | Calculated: $CalculatedBatchSize | Batch Size: $BatchSize (est. item size: $([math]::Round($EstimatedItemSizeBytes/1KB, 2))KB)"
-            for ($i = 0; $i -lt $TotalCount; $i += $BatchSize) {
-                $BatchEnd = [Math]::Min($i + $BatchSize, $TotalCount)
-                $Batch = $Data[$i..($BatchEnd - 1)]
-
-                $Entities = foreach ($Item in $Batch) {
-                    $ItemId = $Item.id ?? $Item.ExternalDirectoryObjectId ?? $Item.Identity ?? $Item.skuId
-                    @{
+        foreach ($Item in @($InputObject)) {
+            if ($null -eq $Item) { continue }
+            $ItemId = $Item.ExternalDirectoryObjectId ?? $Item.id ?? $Item.Identity ?? $Item.skuId ?? $Item.userPrincipalName ?? [guid]::NewGuid().ToString()
+            $RowKey = $RowKeyControlRegex.Replace($RowKeyPathRegex.Replace("$Type-$ItemId", '_'), '')
+            if ($SeenInBatch.Add($RowKey)) {
+                $null = $SeenRowKeys.Add($RowKey)
+                $Batch.Add(@{
                         PartitionKey = $TenantFilter
-                        RowKey       = Format-RowKey "$Type-$ItemId"
-                        Data         = [string]($Item | ConvertTo-Json -Depth 10 -Compress)
+                        RowKey       = $RowKey
+                        # Depth 100, not 10: settings-catalog policies (e.g. macOS
+                        # Platform SSO) nest deeper than 10 levels - a lower depth
+                        # silently strips @odata.type/settingDefinitionId from deep
+                        # children and every consumer sees a mangled object.
+                        Data         = [string]($Item | ConvertTo-Json -Depth 100 -Compress)
                         Type         = $Type
-                    }
+                    })
+                if ($Batch.Count -ge $BatchSize) {
+                    $null = Add-CIPPAzDataTableEntity @Table -Entity $Batch.ToArray() -Force
+                    $TotalProcessed += $Batch.Count
+                    $Batch.Clear()
+                    $SeenInBatch.Clear()
                 }
-
-                Add-CIPPAzDataTableEntity @Table -Entity $Entities -Force | Out-Null
-                $ProcessedCount += $Batch.Count
-
-                # Clear batch variables to free memory
-                $Entities = $null
-                $Batch = $null
-                [System.GC]::Collect()
             }
-
         }
-        Write-LogMessage -API 'CIPPDbItem' -tenant $TenantFilter -message "Added $($Data.Count) items of type $Type$(if ($Count) { ' (count mode)' })" -sev Debug
+    }
 
-    } catch {
-        Write-LogMessage -API 'CIPPDbItem' -tenant $TenantFilter -message "Failed to add items of type $Type : $($_.Exception.Message)" -sev Error -LogData (Get-CippException -Exception $_)
-        throw
+    end {
+        if ($Batch.Count -gt 0) {
+            $null = Add-CIPPAzDataTableEntity @Table -Entity $Batch.ToArray() -Force
+            $TotalProcessed += $Batch.Count
+        }
+
+        # Clean up orphaned rows (entities that no longer exist in the new dataset).
+        # Empty collections only clear existing data when the caller explicitly confirms
+        # the response was authoritative by passing -ClearOnEmpty.
+        if (-not $Count.IsPresent -and -not $Append.IsPresent -and ($TotalProcessed -gt 0 -or $ClearOnEmpty.IsPresent)) {
+            $Filter = "PartitionKey eq '{0}' and RowKey ge '{1}-' and RowKey lt '{1}0'" -f $TenantFilter, $Type
+            $Existing = Get-CIPPAzDataTableEntity @Table -Filter $Filter -Property PartitionKey, RowKey, ETag, OriginalEntityId, Timestamp
+            if ($Existing) {
+                $Undated = 0
+                $Orphans = foreach ($Row in @($Existing)) {
+                    if ($Row.RowKey -eq "$Type-Count") { continue }
+
+                    if ($ClearOnEmpty.IsPresent) {
+                        if (-not $SeenRowKeys.Contains($Row.RowKey)) { $Row }
+                        continue
+                    }
+
+                    $Stamp = $Row.Timestamp -as [datetimeoffset]
+                    if ($null -eq $Stamp) { $Undated++; continue }
+
+                    if ($Stamp -lt $RunStartUtc) { $Row }
+                }
+                if ($Undated -gt 0) {
+                    Write-LogMessage -API 'CIPPDbItem' -tenant $TenantFilter -sev Warning -message "Skipped $Undated $Type row(s) with no readable Timestamp during orphan cleanup — not deleting without positive evidence"
+                }
+                if ($Orphans) {
+                    $null = Remove-CIPPAzDataTableEntity @Table -Entity @($Orphans) -Force
+                }
+            }
+        }
+
+        if ($Count.IsPresent -or $AddCount.IsPresent) {
+            $CntStart = $Stopwatch.ElapsedMilliseconds
+            $NewCount = $TotalProcessed
+            if ($Append.IsPresent) {
+                $Filter = "PartitionKey eq '{0}' and RowKey eq '{1}-Count'" -f $TenantFilter, $Type
+                $ExistingCount = Get-CIPPAzDataTableEntity @Table -Filter $Filter
+                if ($ExistingCount.DataCount) { $NewCount += [int]$ExistingCount.DataCount }
+            }
+            $null = Add-CIPPAzDataTableEntity @Table -Entity @{
+                PartitionKey = $TenantFilter
+                RowKey       = "$Type-Count"
+                DataCount    = [int]$NewCount
+                Type         = $Type
+            } -Force
+            $CountMs = $Stopwatch.ElapsedMilliseconds - $CntStart
+        }
+
+        Write-LogMessage -API 'CIPPDbItem' -tenant $TenantFilter -message "Added $TotalProcessed items of type $Type" -sev Debug
     }
 }

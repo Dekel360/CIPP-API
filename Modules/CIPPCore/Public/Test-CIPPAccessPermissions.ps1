@@ -25,7 +25,6 @@ function Test-CIPPAccessPermissions {
     }
     $Success = $true
     try {
-        Set-Location (Get-Item $PSScriptRoot).FullName
         $null = Get-CIPPAuthentication
         $GraphToken = Get-GraphToken -returnRefresh $true -SkipCache $true
         if ($GraphToken) {
@@ -33,7 +32,7 @@ function Test-CIPPAccessPermissions {
         }
         if ($env:MSI_SECRET) {
             try {
-                $KV = $env:WEBSITE_DEPLOYMENT_ID
+                $KV = Get-CippKeyVaultName
                 $KeyVaultRefresh = Get-CippKeyVaultSecret -VaultName $kv -Name 'RefreshToken' -AsPlainText
                 if ($env:RefreshToken -ne $KeyVaultRefresh) {
                     $Success = $false
@@ -116,11 +115,20 @@ function Test-CIPPAccessPermissions {
                 }
             }
             $Success = $false
-            $Links.Add([PSCustomObject]@{
-                    Text = 'Permissions'
-                    Href = 'https://docs.cipp.app/setup/installation/permissions'
-                }
-            ) | Out-Null
+
+            # Until now this only ever surfaced on the permissions page, so the only way to find
+            # out that CIPP needs new consent was to go and look. Log it so it reaches the
+            # notification pipeline like any other alert. Write-AlertMessage de-duplicates per
+            # day, so a check that runs on every page load doesn't repeat itself.
+            # Logged against the partner tenant - it's the CIPP application that needs consent,
+            # not a customer's tenant.
+            $MissingCount = ($MissingPermissions | Measure-Object).Count
+            $MissingSummary = ($MissingPermissions | ForEach-Object { $_.Permission } | Sort-Object -Unique) -join ', '
+            # Select-Object -First 1 because an empty TenantFilter makes Get-Tenants return every
+            # tenant, which would otherwise land every domain in the alert's Tenant field.
+            $PartnerTenant = Get-Tenants -TenantFilter $TenantFilter | Select-Object -First 1
+            $AlertTenant = if ($PartnerTenant.defaultDomainName) { $PartnerTenant.defaultDomainName } else { 'None' }
+            Write-AlertMessage -tenant $AlertTenant -tenantId $PartnerTenant.customerId -message "CIPP has $MissingCount new permission(s) to apply: $MissingSummary. Review and apply them under CIPP > Application Settings > Permissions."
         } else {
             $Messages.Add('You have all the required permissions.') | Out-Null
         }

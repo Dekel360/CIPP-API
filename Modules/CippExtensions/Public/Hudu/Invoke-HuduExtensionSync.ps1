@@ -8,7 +8,7 @@ function Invoke-HuduExtensionSync {
         $TenantFilter
     )
     try {
-        Connect-HuduAPI -configuration $Configuration
+        Connect-HuduAPI -configuration $Configuration | Out-Null
         $Configuration = $Configuration.Hudu
         $Tenant = Get-Tenants -TenantFilter $TenantFilter -IncludeErrors
         $CompanyResult = [PSCustomObject]@{
@@ -32,9 +32,14 @@ function Invoke-HuduExtensionSync {
         # Get Asset cache
         $HuduAssetCache = Get-CippTable -tablename 'CacheHuduAssets'
 
+        # Get Relations cache - Hudu's relations API has no per-company filter, so this is cached
+        # globally and shared across every tenant's sync instead of pulling the full relations
+        # table (30s+ on large instances) on every single sync run.
+        $HuduRelationsCache = Get-CippTable -tablename 'CacheHuduRelations'
+        $HuduRelationsCacheTTLMinutes = 15
+
         # Import license mapping
-        Set-Location (Get-Item $PSScriptRoot).Parent.Parent.Parent.Parent.FullName
-        $LicTable = Import-Csv ConversionTable.csv
+        $LicTable = [System.IO.File]::ReadAllText((Join-Path $env:CIPPRootPath 'Config\ConversionTable.csv')) | ConvertFrom-Csv
 
         $CompanyResult.Logs.Add('Starting Hudu Extension Sync')
 
@@ -48,6 +53,18 @@ function Invoke-HuduExtensionSync {
         # Include mailboxes if needed for Hudu sync
         $ExtensionCache = Get-CippExtensionReportingData -TenantFilter $Tenant.defaultDomainName -IncludeMailboxes
         $company_id = $TenantMap.IntegrationId
+        $HuduCompany = Get-HuduCompanies -Id $company_id
+        if ($HuduCompany.archived -eq $true) {
+            Write-Host "Company $($HuduCompany.name) is archived. Skipping sync."
+            $ReturnObject = [PSCustomObject]@{
+                Name    = $Tenant.displayName
+                Users   = 0
+                Devices = 0
+                Errors  = [System.Collections.Generic.List[string]]@("Company $($HuduCompany.name) is archived. Skipping sync.")
+                Logs    = [System.Collections.Generic.List[string]]@("Company $($HuduCompany.name) is archived. Skipping sync.")
+            }
+            return $ReturnObject
+        }
 
         # If tenant not found in mapping table, return error
         if (!$TenantMap) {
@@ -66,18 +83,19 @@ function Invoke-HuduExtensionSync {
                 $CreateUsers = $Configuration.CreateMissingUsers
                 $PeopleLayout = Get-HuduAssetLayouts -Id $PeopleLayoutId
                 if ($PeopleLayout.id) {
-                    $People = Get-HuduAssets -CompanyId $company_id -AssetLayoutId $PeopleLayout.id
+                    $PeopleArray = Get-HuduAssets -CompanyId $company_id -AssetLayoutId $PeopleLayout.id
+                    $People = [System.Collections.Generic.List[object]]::new([object[]]@($PeopleArray))
                 } else {
                     $CreateUsers = $false
-                    $People = @()
+                    $People = [System.Collections.Generic.List[object]]::new()
                 }
             } else {
                 $CreateUsers = $false
-                $People = @()
+                $People = [System.Collections.Generic.List[object]]::new()
             }
         } catch {
             $CreateUsers = $false
-            $People = @()
+            $People = [System.Collections.Generic.List[object]]::new()
             $CompanyResult.Errors.add("Company: Unable to fetch People $_")
             Write-Host "Hudu People - Error: $_"
         }
@@ -91,18 +109,18 @@ function Invoke-HuduExtensionSync {
                 $DesktopsLayout = Get-HuduAssetLayouts -Id $DeviceLayoutId
                 if ($DesktopsLayout.id) {
                     $HuduDesktopDevices = Get-HuduAssets -CompanyId $company_id -AssetLayoutId $DesktopsLayout.id
-                    $HuduDevices = $HuduDesktopDevices
+                    $HuduDevices = [System.Collections.Generic.List[object]]::new([object[]]@($HuduDesktopDevices))
                 } else {
                     $CreateDevices = $false
-                    $HuduDevices = @()
+                    $HuduDevices = [System.Collections.Generic.List[object]]::new()
                 }
             } else {
                 $CreateDevices = $false
-                $HuduDevices = @()
+                $HuduDevices = [System.Collections.Generic.List[object]]::new()
             }
         } catch {
             $CreateDevices = $false
-            $HuduDevices = @()
+            $HuduDevices = [System.Collections.Generic.List[object]]::new()
             $CompanyResult.Errors.add("Company: Unable to fetch Devices $_")
             Write-Host "Hudu Devices - Error: $_"
         }
@@ -120,8 +138,50 @@ function Invoke-HuduExtensionSync {
             $ExcludeSerials = $DefaultSerials
         }
 
-        $HuduRelations = Get-HuduRelations
-        $Links = @(
+        $RelationsCacheMeta = Get-CIPPAzDataTableEntity @HuduRelationsCache -Filter "PartitionKey eq 'CacheMetadata' and RowKey eq 'LastRefresh'"
+        $RelationsCacheAgeMinutes = if ($RelationsCacheMeta.LastRefresh) { ((Get-Date).ToUniversalTime() - [datetime]$RelationsCacheMeta.LastRefresh).TotalMinutes } else { $null }
+
+        if ($null -ne $RelationsCacheAgeMinutes -and $RelationsCacheAgeMinutes -lt $HuduRelationsCacheTTLMinutes) {
+            $CachedRelationRows = Get-CIPPAzDataTableEntity @HuduRelationsCache -Filter "PartitionKey eq 'HuduRelation'"
+            $HuduRelations = foreach ($CachedRelationRow in $CachedRelationRows) {
+                [PSCustomObject]@{
+                    id            = $CachedRelationRow.RowKey
+                    fromable_type = $CachedRelationRow.FromableType
+                    fromable_id   = $CachedRelationRow.FromableId
+                    toable_type   = $CachedRelationRow.ToableType
+                    toable_id     = $CachedRelationRow.ToableId
+                }
+            }
+        } else {
+            $HuduRelations = Get-HuduRelations
+
+            $ExistingRelationRows = Get-CIPPAzDataTableEntity @HuduRelationsCache -Filter "PartitionKey eq 'HuduRelation'"
+            if ($ExistingRelationRows) {
+                Remove-CIPPAzDataTableEntity @HuduRelationsCache -Entity $ExistingRelationRows -Force
+            }
+
+            $RelationEntities = foreach ($Relation in $HuduRelations) {
+                [PSCustomObject]@{
+                    PartitionKey  = 'HuduRelation'
+                    RowKey        = [string]$Relation.id
+                    FromableType  = [string]$Relation.fromable_type
+                    FromableId    = [string]$Relation.fromable_id
+                    ToableType    = [string]$Relation.toable_type
+                    ToableId      = [string]$Relation.toable_id
+                }
+            }
+            if ($RelationEntities) {
+                Add-CIPPAzDataTableEntity @HuduRelationsCache -Entity $RelationEntities -Force
+            }
+
+            $RelationsCacheMetaEntity = [PSCustomObject]@{
+                PartitionKey = 'CacheMetadata'
+                RowKey       = 'LastRefresh'
+                LastRefresh  = (Get-Date).ToUniversalTime().ToString('o')
+            }
+            Add-CIPPAzDataTableEntity @HuduRelationsCache -Entity $RelationsCacheMetaEntity -Force
+        }
+        [System.Collections.Generic.List[object]]$Links = @(
             @{
                 Title = 'M365 Admin Portal'
                 URL   = 'https://admin.cloud.microsoft?delegatedOrg={0}' -f $Tenant.initialDomainName
@@ -153,6 +213,28 @@ function Invoke-HuduExtensionSync {
                 Icon  = 'fas fa-server'
             }
         )
+        if ($Configuration.IncludeDefenderLink) {
+            $Links.Add(@{
+                    Title = 'Defender Portal'
+                    URL   = 'https://security.microsoft.com/?tid={0}' -f $Tenant.customerId
+                    Icon  = 'fas fa-shield'
+                })
+        }
+        if ($Configuration.IncludeComplianceLink) {
+            $Links.Add(@{
+                    Title = 'Compliance Portal'
+                    URL   = 'https://compliance.microsoft.com/?tid={0}' -f $Tenant.customerId
+                    Icon  = 'fas fa-caret-up'
+                })
+        }
+        if ($Configuration.IncludeParterCenterLink) {
+            $Links.Add(@{
+                    Title = 'Partner Center Portals'
+                    URL   = 'https://partner.microsoft.com/dashboard/v2/customers/{0}/servicemanagementpage' -f $Tenant.customerId
+                    Icon  = 'fas fa-arrow-up-right-from-square'
+                })
+        }
+
         $FormattedLinks = foreach ($Link in $Links) {
             Get-HuduLinkBlock @Link
         }
@@ -183,6 +265,11 @@ function Invoke-HuduExtensionSync {
 			 </header>"
 
         $post = '</div>'
+
+        if ($Configuration.HideEmptyRoles) {
+            $Roles = $Roles | Where-Object { $_.ParsedMembers }
+        }
+
         $RolesHtml = $Roles | Select-Object DisplayName, Description, ParsedMembers | ConvertTo-Html -PreContent $pre -PostContent $post -Fragment | ForEach-Object { $tmp = $_ -replace '&lt;', '<'; $tmp -replace '&gt;', '>'; } | Out-String
 
         $AdminUsers = (($Roles | Where-Object { $_.displayName -match 'Administrator' }).Members | Where-Object { $null -ne $_.displayName } | Select-Object @{N = 'Name'; E = { "<a target='_blank' href='https://entra.microsoft.com/$($Tenant.defaultDomainName)/#blade/Microsoft_AAD_IAM/UserDetailsMenuBlade/Profile/userId/$($_.Id)'>$($_.displayName) - $($_.userPrincipalName)</a>" } } -Unique).name -join '<br/>'
@@ -245,7 +332,7 @@ function Invoke-HuduExtensionSync {
 
             $post = '</div>'
 
-            $licenseOut = $Licenses | Where-Object { $_.PrepaidUnits.Enabled -gt 0 } | Select-Object @{N = 'License Name'; E = { Convert-SKUname -skuName $_.SkuPartNumber -ConvertTable $LicTable } }, @{N = 'Active'; E = { $_.PrepaidUnits.Enabled } }, @{N = 'Consumed'; E = { $_.ConsumedUnits } }, @{N = 'Unused'; E = { $_.PrepaidUnits.Enabled - $_.ConsumedUnits } }
+            $licenseOut = $Licenses | Where-Object { $_.PrepaidUnits.Enabled -gt 0 } | Select-Object @{N = 'License Name'; E = { $_.SkuPartNumber } }, @{N = 'Active'; E = { $_.PrepaidUnits.Enabled } }, @{N = 'Consumed'; E = { $_.ConsumedUnits } }, @{N = 'Unused'; E = { $_.PrepaidUnits.Enabled - $_.ConsumedUnits } }
             $licenseHTML = $licenseOut | ConvertTo-Html -PreContent $pre -PostContent $post -Fragment | Out-String
         }
 
@@ -518,11 +605,10 @@ function Invoke-HuduExtensionSync {
                     $userLicenses = ($user.AssignedLicenses.SkuID | ForEach-Object {
                             $UserLic = $_
                             $SkuPartNumber = ($Licenses | Where-Object { $_.SkuId -eq $UserLic }).SkuPartNumber
-                            $DisplayName = Convert-SKUname -skuName $SkuPartNumber -ConvertTable $LicTable
-                            if (!$DisplayName) {
-                                $DisplayName = $SkuPartNumber
+                            if (!$SkuPartNumber) {
+                                $SkuPartNumber = 'Unknown License'
                             }
-                            $DisplayName
+                            $SkuPartNumber
                         }) -join ', '
 
                     $UserOneDriveDetails = $OneDriveDetails | Where-Object { $_.ownerPrincipalName -eq $user.userPrincipalName }
@@ -753,6 +839,8 @@ function Invoke-HuduExtensionSync {
                                         Hash         = [string]$NewHash
                                     }
                                     Add-CIPPAzDataTableEntity @HuduAssetCache -Entity $AssetCache -Force
+                                    # Add newly created user to the People collection to prevent duplicates
+                                    $People.Add($CreateHuduUser)
                                 }
                             }
                         } else {
@@ -841,7 +929,7 @@ function Invoke-HuduExtensionSync {
                             foreach ($Status in $MatchingStatuses) {
                                 Write-Information "Processing Status for Device $($device.deviceName), Policy $($Policy.displayName)"
                                 # Filter out invalid statuses
-                                if ($Status.status -and $Status.status -ne 'unknown' -and $Status.status -ne $null) {
+                                if ($Status.status -and $Status.status -ne 'unknown' -and $null -ne $Status.status) {
                                     try {
                                         $LastReport = if ($Status.lastReportedDateTime) {
                                             (Get-Date $Status.lastReportedDateTime -Format 'yyyy-MM-dd HH:mm:ss')
@@ -997,6 +1085,8 @@ function Invoke-HuduExtensionSync {
                                         Hash         = [string]$NewHash
                                     }
                                     Add-CIPPAzDataTableEntity @HuduAssetCache -Entity $AssetCache -Force
+                                    # Add newly created device to the HuduDevices collection to prevent duplicates
+                                    $HuduDevices.Add($CreateHuduDevice)
 
                                     $RelHuduUser = $People | Where-Object { $_.primary_mail -eq $Device.userPrincipalName -or ($_.cards.integrator_name -eq 'cw_manage' -and $_.cards.data.communicationItems.communicationType -eq 'Email' -and $_.cards.data.communicationItems.value -eq $Device.userPrincipalName) }
                                     if ($RelHuduUser) {
