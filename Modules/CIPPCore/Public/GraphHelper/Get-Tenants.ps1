@@ -35,14 +35,16 @@ function Get-Tenants {
 
     if ($TenantFilter) {
         #Write-Information "Getting tenant $TenantFilter"
-        if ($TenantFilter -match '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') {
-            $Filter = "{0} and customerId eq '{1}'" -f $Filter, $TenantFilter
+        $SafeTenantFilter = ConvertTo-CIPPODataFilterValue -Value $TenantFilter -Type String
+
+        if ($SafeTenantFilter -match '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') {
+            $Filter = "{0} and customerId eq '{1}'" -f $Filter, $SafeTenantFilter
             # create where-object scriptblock
-            $IncludedTenantFilter = [scriptblock]::Create("`$_.customerId -eq '$TenantFilter'")
-            $RelationshipFilter = " and customer/tenantId eq '$TenantFilter'"
+            $IncludedTenantFilter = [scriptblock]::Create("`$_.customerId -eq '$SafeTenantFilter'")
+            $RelationshipFilter = " and customer/tenantId eq '$SafeTenantFilter'"
         } else {
-            $Filter = "{0} and defaultDomainName eq '{1}' or initialDomainName eq '{1}'" -f $Filter, $TenantFilter
-            $IncludedTenantFilter = [scriptblock]::Create("`$_.defaultDomainName -eq '$TenantFilter' -or `$_.initialDomainName -eq '$TenantFilter'")
+            $Filter = "{0} and defaultDomainName eq '{1}' or initialDomainName eq '{1}'" -f $Filter, $SafeTenantFilter
+            $IncludedTenantFilter = [scriptblock]::Create("`$_.defaultDomainName -eq '$SafeTenantFilter' -or `$_.initialDomainName -eq '$SafeTenantFilter'")
             $RelationshipFilter = ''
         }
     } else {
@@ -80,7 +82,7 @@ function Get-Tenants {
         }
         $CurrentTenants = Get-CIPPAzDataTableEntity @TenantsTable -Filter "PartitionKey eq 'Tenants' and Excluded eq false and delegatedPrivilegeStatus ne 'directTenant'"
         $CurrentTenants | Where-Object { $_.customerId -notin $GDAPList.customerId -and $_.customerId -ne $env:TenantID } | ForEach-Object {
-            Remove-AzDataTableEntity -Force @TenantsTable -Entity $_
+            Remove-CIPPAzDataTableEntity -Force @TenantsTable -Entity $_
         }
     }
     $PartnerModeTable = Get-CippTable -tablename 'tenantMode'
@@ -275,8 +277,11 @@ function Get-Tenants {
         }
     }
 
-    # Limit tenant list to allowed tenants if set in script scope from New-CippCoreRequest
-    if ($script:CippAllowedTenantsStorage -and $script:CippAllowedTenantsStorage.Value) {
+    # Limit tenant list to allowed tenants if set in script scope from New-CippCoreRequest.
+    # $null means unrestricted; any non-null scope filters, so a restricted caller whose scope
+    # resolved to zero tenants gets an empty list back rather than every tenant (an empty array
+    # is falsy, so a plain truthiness check would silently skip the narrowing).
+    if ($script:CippAllowedTenantsStorage -and $null -ne $script:CippAllowedTenantsStorage.Value) {
         $IncludedTenantsCache = $IncludedTenantsCache | Where-Object { $script:CippAllowedTenantsStorage.Value -contains $_.customerId }
     }
 
