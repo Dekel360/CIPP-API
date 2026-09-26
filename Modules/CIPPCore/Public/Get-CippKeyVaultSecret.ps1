@@ -23,6 +23,7 @@ function Get-CippKeyVaultSecret {
     Get-CippKeyVaultSecret -VaultName 'mykeyvault' -Name 'RefreshToken' -AsPlainText
     #>
     [CmdletBinding()]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingConvertToSecureStringWithPlainText', '', Justification = 'Wraps the value returned by the Key Vault REST call in a SecureString to match the Get-AzKeyVaultSecret return shape')]
     param(
         [Parameter(Mandatory = $false)]
         [string]$VaultName,
@@ -37,21 +38,42 @@ function Get-CippKeyVaultSecret {
     try {
         # Derive vault name if not provided
         if (-not $VaultName) {
-            if ($env:WEBSITE_DEPLOYMENT_ID) {
-                $VaultName = ($env:WEBSITE_DEPLOYMENT_ID -split '-')[0]
-            } else {
-                throw "VaultName not provided and WEBSITE_DEPLOYMENT_ID environment variable not set"
+            $VaultName = Get-CippKeyVaultName
+            if (-not $VaultName) {
+                throw 'VaultName not provided and could not be derived (WEBSITE_SITE_NAME / WEBSITE_DEPLOYMENT_ID not set)'
             }
         }
 
         # Get access token for Key Vault
-        $token = Get-CIPPAzIdentityToken -ResourceUrl "https://vault.azure.net"
+        $token = Get-CIPPAzIdentityToken -ResourceUrl 'https://vault.azure.net'
 
-        # Call Key Vault REST API
+        # Call Key Vault REST API with retry logic
         $uri = "https://$VaultName.vault.azure.net/secrets/$Name`?api-version=7.4"
-        $response = Invoke-RestMethod -Uri $uri -Headers @{
-            Authorization = "Bearer $token"
-        } -Method Get -ErrorAction Stop
+        $maxRetries = 3
+        $retryDelay = 2
+        $response = $null
+
+        for ($i = 0; $i -lt $maxRetries; $i++) {
+            try {
+                $response = Invoke-CIPPRestMethod -Uri $uri -Headers @{
+                    Authorization = "Bearer $token"
+                } -Method Get -ErrorAction Stop
+                break
+            } catch {
+                $lastError = $_
+                # 404 is definitive - the secret does not exist and retrying cannot change that
+                if ($_.Exception.Message -match '404|SecretNotFound') {
+                    throw "Failed to retrieve secret '$Name' from vault '$VaultName': $($_.Exception.Message)"
+                }
+                if ($i -lt ($maxRetries - 1)) {
+                    Start-Sleep -Seconds $retryDelay
+                    $retryDelay *= 2  # Exponential backoff
+                } else {
+                    Write-Error "Failed to retrieve secret '$Name' from vault '$VaultName' after $maxRetries attempts: $($_.Exception.Message)"
+                    throw "Failed to retrieve secret '$Name' from vault '$VaultName' after $maxRetries attempts: $($_.Exception.Message)"
+                }
+            }
+        }
 
         # Return based on AsPlainText switch
         if ($AsPlainText) {
@@ -60,12 +82,13 @@ function Get-CippKeyVaultSecret {
             # Return object similar to Get-AzKeyVaultSecret for compatibility
             return @{
                 SecretValue = ($response.value | ConvertTo-SecureString -AsPlainText -Force)
-                Name = $Name
-                VaultName = $VaultName
+                Name        = $Name
+                VaultName   = $VaultName
             }
         }
     } catch {
-        Write-Error "Failed to retrieve secret '$Name' from vault '$VaultName': $($_.Exception.Message)"
-        throw
+        # Error already handled in retry loop, just rethrow
+        Write-Error "CRITICAL: Key Vault secret retrieval failed: $($_.Exception.Message)"
+        throw "Key Vault secret retrieval failed: $($_.Exception.Message)"
     }
 }

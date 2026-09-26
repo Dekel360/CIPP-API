@@ -12,6 +12,8 @@ function New-ExoBulkRequest {
         $NoAuthCheck,
         $Select,
         $ReturnWithCommand,
+        [int]$MaxConcurrency = 1,
+        [int]$TimeoutSec = 100,
         [switch]$Compliance,
         [switch]$AsApp
     )
@@ -44,6 +46,7 @@ function New-ExoBulkRequest {
             # Initialize the ID to Cmdlet Name mapping
             $IdToCmdletName = @{}
             $IdToOperationGuid = @{}  # Track operation GUIDs when provided
+            $IdToBatchRequest = @{}   # Original sub-requests, reused for nextLink continuations
 
             # Split the cmdletArray into batches of 10
             $batches = [System.Collections.Generic.List[object]]::new()
@@ -52,6 +55,7 @@ function New-ExoBulkRequest {
             }
 
             $ReturnedData = [System.Collections.Generic.List[object]]::new()
+            $BatchPayloads = [System.Collections.Generic.List[object]]::new()
             foreach ($batch in $batches) {
                 $BatchBodyObj = @{
                     requests = @()
@@ -93,18 +97,135 @@ function New-ExoBulkRequest {
 
                     # Map the Request ID to the Cmdlet Name and Operation GUID (if provided)
                     $IdToCmdletName[$RequestId] = $cmd.CmdletInput.CmdletName
+                    $IdToBatchRequest[$RequestId] = $BatchRequest
                     if ($cmd.OperationGuid) {
                         $IdToOperationGuid[$RequestId] = $cmd.OperationGuid
                     }
                 }
                 $BatchBodyJson = ConvertTo-Json -InputObject $BatchBodyObj -Depth 10
                 $BatchBodyJson = Get-CIPPTextReplacement -TenantFilter $tenantid -Text $BatchBodyJson
-                $Results = Invoke-RestMethod $BatchURL -ResponseHeadersVariable responseHeaders -Method POST -Body $BatchBodyJson -Headers $Headers -ContentType 'application/json; charset=utf-8'
-                foreach ($Response in $Results.responses) {
-                    $ReturnedData.Add($Response)
+                # Clone the headers as they stood for this batch's POST (X-AnchorMailbox/X-CmdletName are
+                # mutated per sub-request above); the $batch envelope also carries per-request headers.
+                $BatchPayloads.Add(@{ Json = $BatchBodyJson; Headers = $Headers.Clone() })
+            }
+
+            # Dispatch a set of batch payloads and return the flattened sub-responses. -MaxConcurrency 1
+            # (default) keeps the sequential Invoke-CIPPRestMethod loop; >1 fans out via
+            # CIPP.CIPPRestClient.SendConcurrent, which bounds concurrency and retries a fully-429'd/5xx
+            # POST honouring Retry-After (its backoff is separate from the per-request -TimeoutSec, so a
+            # rate-limit wait never trips the timeout). EXO caps each $batch at 10 sub-requests.
+            function Send-BatchPayloadSet {
+                param($Payloads, $DispatchUrl, $Concurrency, $Timeout)
+                $Out = [System.Collections.Generic.List[object]]::new()
+                if ($Concurrency -gt 1 -and @($Payloads).Count -gt 1) {
+                    $ConcRequests = [System.Collections.Generic.List[CIPP.CIPPConcurrentRequest]]::new()
+                    foreach ($Payload in $Payloads) {
+                        $ConcRequest = [CIPP.CIPPConcurrentRequest]::new()
+                        $ConcRequest.Uri = $DispatchUrl
+                        $ConcRequest.Method = 'POST'
+                        $ConcRequest.Body = $Payload.Json
+                        $ConcRequest.ContentType = 'application/json; charset=utf-8'
+                        $ConcRequest.TimeoutSec = $Timeout
+                        $ConcHeaders = [System.Collections.Generic.Dictionary[string, string]]::new()
+                        foreach ($HeaderKey in $Payload.Headers.Keys) { $ConcHeaders[$HeaderKey] = [string]$Payload.Headers[$HeaderKey] }
+                        $ConcRequest.Headers = $ConcHeaders
+                        $ConcRequests.Add($ConcRequest)
+                    }
+                    foreach ($ConcResult in [CIPP.CIPPRestClient]::SendConcurrent($ConcRequests, $Concurrency, 3)) {
+                        if ($ConcResult.Error) {
+                            Write-Host "EXO bulk batch failed after $($ConcResult.Attempts) attempt(s): $($ConcResult.Error)"
+                            continue
+                        }
+                        try {
+                            $Parsed = $ConcResult.Result.Content | ConvertFrom-Json
+                        } catch {
+                            Write-Host "EXO bulk batch: could not parse response (HTTP $($ConcResult.StatusCode))"
+                            continue
+                        }
+                        foreach ($Response in $Parsed.responses) { $Out.Add($Response) }
+                    }
+                } else {
+                    foreach ($Payload in $Payloads) {
+                        $Results = Invoke-CIPPRestMethod $DispatchUrl -ResponseHeadersVariable responseHeaders -Method POST -Body $Payload.Json -Headers $Payload.Headers -ContentType 'application/json; charset=utf-8' -TimeoutSec $Timeout
+                        foreach ($Response in $Results.responses) { $Out.Add($Response) }
+                    }
+                }
+                return $Out
+            }
+
+            foreach ($Response in (Send-BatchPayloadSet $BatchPayloads $BatchURL $MaxConcurrency $TimeoutSec)) { $ReturnedData.Add($Response) }
+
+            # EXO can throttle individual sub-requests inside a 200 batch envelope (status 429 per response,
+            # emitted under Prefer: odata.continue-on-error). SendConcurrent only sees the outer 200, so
+            # retry those here: rebuild the throttled sub-requests into fresh batches, honour Retry-After
+            # (else a capped exponential backoff), and swap the successful results back in by id.
+            $RateLimitRetry = 0
+            while ($RateLimitRetry -lt 3) {
+                $Throttled = @($ReturnedData | Where-Object { $_.status -eq 429 -and $_.id -and $IdToBatchRequest.ContainsKey($_.id) })
+                if ($Throttled.Count -eq 0) { break }
+                $RateLimitRetry++
+                $RetryAfter = 0
+                foreach ($ThrottledResponse in $Throttled) { $Ra = $ThrottledResponse.headers.'Retry-After' -as [int]; if ($Ra -gt $RetryAfter) { $RetryAfter = $Ra } }
+                if ($RetryAfter -le 0) { $RetryAfter = [int][math]::Pow(2, $RateLimitRetry) }  # 2s, 4s, 8s
+                Start-Sleep -Seconds $RetryAfter
+
+                $ThrottledRequests = @($Throttled | ForEach-Object { $IdToBatchRequest[$_.id] })
+                $RetryPayloads = [System.Collections.Generic.List[object]]::new()
+                for ($i = 0; $i -lt $ThrottledRequests.Count; $i += 10) {
+                    $Slice = $ThrottledRequests[$i..[math]::Min($i + 9, $ThrottledRequests.Count - 1)]
+                    $RetryJson = ConvertTo-Json -InputObject @{ requests = @($Slice) } -Depth 10
+                    $RetryJson = Get-CIPPTextReplacement -TenantFilter $tenantid -Text $RetryJson
+                    $RetryPayloads.Add(@{ Json = $RetryJson; Headers = $Headers.Clone() })
                 }
 
-                Write-Host "Batch #$($batches.IndexOf($batch) + 1) of $($batches.Count) processed"
+                $Replacements = @{}
+                foreach ($Response in (Send-BatchPayloadSet $RetryPayloads $BatchURL $MaxConcurrency $TimeoutSec)) { if ($Response.id) { $Replacements[$Response.id] = $Response } }
+                for ($i = 0; $i -lt $ReturnedData.Count; $i++) {
+                    if ($ReturnedData[$i].id -and $Replacements.ContainsKey($ReturnedData[$i].id)) { $ReturnedData[$i] = $Replacements[$ReturnedData[$i].id] }
+                }
+            }
+
+            # Follow @odata.nextLink continuations so results are not capped at one page (mirrors New-GraphBulkRequest).
+            # The EXO admin API pages by re-POSTing the same CmdletInput body to the nextLink URL.
+            $IdToResponse = @{}
+            $NextLinkQueue = [System.Collections.Generic.Queue[object]]::new()
+            foreach ($Response in $ReturnedData) {
+                if ($Response.id -and -not $IdToResponse.ContainsKey($Response.id)) {
+                    $IdToResponse[$Response.id] = $Response
+                }
+                if ($Response.body.'@odata.nextLink' -and $IdToBatchRequest.ContainsKey($Response.id)) {
+                    $NextLinkQueue.Enqueue(@{ id = $Response.id; url = $Response.body.'@odata.nextLink' })
+                }
+            }
+
+            while ($NextLinkQueue.Count -gt 0) {
+                # Drain up to 10 nextLinks into a single $batch, same size as the main loop
+                $NextBatchRequests = [System.Collections.Generic.List[object]]::new()
+                while ($NextLinkQueue.Count -gt 0 -and $NextBatchRequests.Count -lt 10) {
+                    $Item = $NextLinkQueue.Dequeue()
+                    $ContinuationRequest = $IdToBatchRequest[$Item.id].Clone()
+                    $ContinuationRequest['url'] = $Item.url
+                    $NextBatchRequests.Add($ContinuationRequest)
+                }
+
+                Write-Host "Fetching next page for $($NextBatchRequests.Count) request(s)"
+                $NextBatchBodyJson = ConvertTo-Json -InputObject @{ requests = @($NextBatchRequests) } -Depth 10
+                $NextBatchBodyJson = Get-CIPPTextReplacement -TenantFilter $tenantid -Text $NextBatchBodyJson
+                $NextResults = Invoke-CIPPRestMethod $BatchURL -Method POST -Body $NextBatchBodyJson -Headers $Headers -ContentType 'application/json; charset=utf-8'
+
+                foreach ($NextResponse in $NextResults.responses) {
+                    $OriginalResponse = $IdToResponse[$NextResponse.id]
+                    if (-not $OriginalResponse) { continue }
+                    if ($NextResponse.body.value) {
+                        $MergedValues = [System.Collections.Generic.List[object]]::new()
+                        foreach ($val in @($OriginalResponse.body.value)) { $MergedValues.Add($val) }
+                        foreach ($val in @($NextResponse.body.value)) { $MergedValues.Add($val) }
+                        $OriginalResponse.body.value = $MergedValues
+                    }
+                    if ($NextResponse.body.'@odata.nextLink') {
+                        $NextLinkQueue.Enqueue(@{ id = $NextResponse.id; url = $NextResponse.body.'@odata.nextLink' })
+                    }
+                }
             }
         } catch {
             # Error handling (omitted for brevity)
@@ -221,6 +342,6 @@ function New-ExoBulkRequest {
         return $FinalData
 
     } else {
-        Write-Error 'Not allowed. You cannot manage your own tenant or tenants not under your scope'
+        Write-Error (Get-AuthorisedRequestError -TenantID $tenantid -Context 'Exchange bulk request')
     }
 }
