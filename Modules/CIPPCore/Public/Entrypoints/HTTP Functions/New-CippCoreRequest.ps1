@@ -3,7 +3,7 @@ using namespace Microsoft.Azure.Functions.PowerShellWorker
 function New-CippCoreRequest {
     <#
     .SYNOPSIS
-        Main entrypoint for all HTTP triggered functions in CIPP
+        Main entrypoint for all HTTP triggered functions in CIPP, this must live in the CIPPCore module
     .DESCRIPTION
         This function is the main entry point for all HTTP triggered functions in CIPP. It routes requests to the appropriate function based on the CIPPEndpoint parameter in the request.
     .FUNCTIONALITY
@@ -16,24 +16,10 @@ function New-CippCoreRequest {
     $HttpTimings = @{}
     $HttpTotalStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
-    # Initialize AsyncLocal storage for thread-safe per-invocation context
-    if (-not $script:CippInvocationIdStorage) {
-        $script:CippInvocationIdStorage = [System.Threading.AsyncLocal[string]]::new()
-    }
-    if (-not $script:CippAllowedTenantsStorage) {
-        $script:CippAllowedTenantsStorage = [System.Threading.AsyncLocal[object]]::new()
-    }
-    if (-not $script:CippAllowedGroupsStorage) {
-        $script:CippAllowedGroupsStorage = [System.Threading.AsyncLocal[object]]::new()
-    }
-    if (-not $script:CippUserRolesStorage) {
-        $script:CippUserRolesStorage = [System.Threading.AsyncLocal[hashtable]]::new()
-    }
-
-    # Initialize user roles cache for this request
-    if (-not $script:CippUserRolesStorage.Value) {
-        $script:CippUserRolesStorage.Value = @{}
-    }
+    # Initialize and reset the per-invocation context slots. This has to happen before anything
+    # reads them: workers are reused between requests, so whatever the previous invocation left
+    # behind is still in scope until it is explicitly cleared.
+    Initialize-CippRequestContext
 
     # Set InvocationId in AsyncLocal storage for console logging correlation
     if ($global:TelemetryClient -and $TriggerMetadata.InvocationId) {
@@ -41,7 +27,44 @@ function New-CippCoreRequest {
     }
 
     $FunctionName = 'Invoke-{0}' -f $Request.Params.CIPPEndpoint
-    Write-Information "API Endpoint: $($Request.Params.CIPPEndpoint) | Frontend Version: $($Request.Headers.'X-CIPP-Version' ?? 'Not specified')"
+    Write-Debug "API Endpoint: $($Request.Params.CIPPEndpoint) | Frontend Version: $($Request.Headers.'X-CIPP-Version' ?? 'Not specified')"
+
+    # Store action source + acting identity for outbound User-Agent attribution
+    Set-CippUserAgentContext -Headers $Request.Headers
+
+    # Check if endpoint is disabled via feature flags
+    $FeatureFlags = Get-CIPPFeatureFlag
+
+    # In CIPP-NG, force-enable SuperAdminNG regardless of the stored flag state.
+    if ($env:CIPPNG -eq 'true') {
+        foreach ($Flag in $FeatureFlags) {
+            if ($Flag.Id -eq 'SuperAdminNG') {
+                $Flag.Enabled = $true
+            }
+        }
+    }
+
+    $DisabledEndpoint = $FeatureFlags | Where-Object {
+        $_.Enabled -eq $false -and $_.Endpoints -contains $Request.Params.CIPPEndpoint
+    } | Select-Object -First 1
+
+    if ($DisabledEndpoint) {
+        Write-Information "Endpoint $($Request.Params.CIPPEndpoint) is disabled via feature flag: $($DisabledEndpoint.Name)"
+        $HttpTotalStopwatch.Stop()
+        return ([HttpResponseContext]@{
+                StatusCode = [HttpStatusCode]::ServiceUnavailable
+                Body       = "This feature has been disabled: $($DisabledEndpoint.Description)"
+            })
+    }
+
+    # Block all API calls except /api/me when subscription has ended
+    if ($env:cipp_hosted_subscription_ended -and $Request.Params.CIPPEndpoint -ne 'me') {
+        $HttpTotalStopwatch.Stop()
+        return ([HttpResponseContext]@{
+                StatusCode = [HttpStatusCode]::Forbidden
+                Body       = 'Your CIPP subscription has ended. Access to this instance is no longer available.'
+            })
+    }
 
     if ($Request.Headers.'X-CIPP-Version') {
         $Table = Get-CippTable -tablename 'Version'
@@ -81,8 +104,15 @@ function New-CippCoreRequest {
                     Write-Debug "#### HTTP Request Timings #### $($HttpTimingsRounded | ConvertTo-Json -Compress)"
                     return $Access
                 }
+                # One access line per real endpoint call; /me returns above and the
+                # scope lookups below stay silent. Context is set by Test-CIPPAccess.
+                if ($script:CippAccessUserContext) {
+                    Write-Information "Access: $($script:CippAccessUserContext.User) [$($script:CippAccessUserContext.Roles -join ', ')] -> $($Request.Params.CIPPEndpoint)"
+                }
+                $script:CippRealtimeUser = $Request.Headers.'x-ms-client-principal-name'
             } catch {
-                Write-Information "Access denied for $FunctionName : $($_.Exception.Message)"
+                $DeniedUser = if ($script:CippAccessUserContext) { " for user $($script:CippAccessUserContext.User) [$($script:CippAccessUserContext.Roles -join ', ')]" } else { '' }
+                Write-Information "Access denied for $FunctionName$($DeniedUser) : $($_.Exception.Message)"
                 $HttpTotalStopwatch.Stop()
                 $HttpTimings['Total'] = $HttpTotalStopwatch.Elapsed.TotalMilliseconds
                 $HttpTimingsRounded = [ordered]@{}
@@ -94,27 +124,39 @@ function New-CippCoreRequest {
                     })
             }
             $swTenants = [System.Diagnostics.Stopwatch]::StartNew()
-            $AllowedTenants = Test-CippAccess -Request $Request -TenantList
+            # The @() wrap is load-bearing: a scope-only call can return an empty list (a
+            # restricted caller entitled to nothing), and a bare assignment unwraps that to
+            # $null - the sentinel consumers read as 'unrestricted'. The wrap keeps the empty
+            # list an empty list so the storage below stores a restricted scope, not a free pass.
+            $AllowedTenants = @(Test-CippAccess -Request $Request -TenantList)
             $swTenants.Stop()
             $HttpTimings['AllowedTenants'] = $swTenants.Elapsed.TotalMilliseconds
 
             $swGroups = [System.Diagnostics.Stopwatch]::StartNew()
-            $AllowedGroups = Test-CippAccess -Request $Request -GroupList
+            $AllowedGroups = @(Test-CippAccess -Request $Request -GroupList)
             $swGroups.Stop()
             $HttpTimings['AllowedGroups'] = $swGroups.Elapsed.TotalMilliseconds
 
+            # Assign on every path, including the unrestricted one. Only writing the slot when
+            # access is limited is what allowed a restricted user's scope to survive into the
+            # next request handled by the same worker, silently filtering results for someone
+            # entitled to see everything.
             if ($AllowedTenants -notcontains 'AllTenants') {
                 Write-Warning 'Limiting tenant access'
                 $script:CippAllowedTenantsStorage.Value = $AllowedTenants
+            } else {
+                $script:CippAllowedTenantsStorage.Value = $null
             }
             if ($AllowedGroups -notcontains 'AllGroups') {
                 Write-Warning 'Limiting group access'
                 $script:CippAllowedGroupsStorage.Value = $AllowedGroups
+            } else {
+                $script:CippAllowedGroupsStorage.Value = $null
             }
 
             try {
-                Write-Information "Access: $Access"
-                Write-LogMessage -headers $Headers -API $Request.Params.CIPPEndpoint -message 'Accessed this API' -Sev 'Debug'
+                Write-Debug "Access: $Access"
+                Write-LogMessage -headers $Request.Headers -API $Request.Params.CIPPEndpoint -message 'Accessed this API' -Sev 'Debug'
                 if ($Access) {
                     # Prepare telemetry metadata for HTTP API call
                     $metadata = @{

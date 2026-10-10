@@ -6,7 +6,7 @@ function Get-CIPPMFAState {
         $Headers
     )
     #$PerUserMFAState = Get-CIPPPerUserMFA -TenantFilter $TenantFilter -AllUsers $true
-    $users = foreach ($user in (New-GraphGetRequest -uri 'https://graph.microsoft.com/v1.0/users?$top=999&$select=id,UserPrincipalName,DisplayName,accountEnabled,assignedLicenses,perUserMfaState' -tenantid $TenantFilter)) {
+    $users = foreach ($user in (New-GraphGetRequest -uri 'https://graph.microsoft.com/v1.0/users?$top=999&$select=id,UserPrincipalName,DisplayName,accountEnabled,assignedLicenses,perUserMfaState,userType' -tenantid $TenantFilter)) {
         [PSCustomObject]@{
             UserPrincipalName = $user.UserPrincipalName
             isLicensed        = [boolean]$user.assignedLicenses.Count
@@ -14,6 +14,7 @@ function Get-CIPPMFAState {
             DisplayName       = $user.DisplayName
             ObjectId          = $user.id
             perUserMfaState   = $user.perUserMfaState
+            UserType          = $user.userType
         }
     }
 
@@ -22,10 +23,14 @@ function Get-CIPPMFAState {
     $CASuccess = $false
     $CAError = $null
     $PolicyTable = @{}
-    $AllUserPolicies = @()
+    $AllUserPolicies = [System.Collections.Generic.List[object]]::new()
+    $GuestUserPolicies = [System.Collections.Generic.List[object]]::new()
     $UserGroupMembership = @{}
     $UserExcludeGroupMembership = @{}
     $GroupNameLookup = @{}
+    $UserRoleMembership = @{}
+    $UserExcludeRoleMembership = @{}
+    $RoleNameLookup = @{}
     $MFAIndex = @{}
 
     try {
@@ -47,7 +52,7 @@ function Get-CIPPMFAState {
     } catch {
         $CAState.Add('Not Licensed for Conditional Access') | Out-Null
         $MFARegistration = $null
-        $CAError = "MFA registration not available - licensing required for Conditional Access reporting"
+        $CAError = 'MFA registration not available - licensing required for Conditional Access reporting'
         if ($_.Exception.Message -ne "Tenant is not a B2C tenant and doesn't have premium licenses") {
             $Errors.Add(@{Step = 'MFARegistration'; Message = $_.Exception.Message })
         }
@@ -62,6 +67,22 @@ function Get-CIPPMFAState {
             $AllUserPolicies = [System.Collections.Generic.List[object]]::new()
             $GroupsToResolve = [System.Collections.Generic.HashSet[string]]::new()
             $ExcludeGroupsToResolve = [System.Collections.Generic.HashSet[string]]::new()
+            $RolesToResolve = [System.Collections.Generic.HashSet[string]]::new()
+            $ExcludeRolesToResolve = [System.Collections.Generic.HashSet[string]]::new()
+
+            # Fetch role assignments and definitions early for role-targeted CA policies
+            $assignments = New-GraphGetRequest -uri "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?`$expand=principal" -tenantid $TenantFilter -ErrorAction SilentlyContinue
+            $roleDefinitions = New-GraphGetRequest -uri "https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions?`$select=id,templateId,displayName" -tenantid $TenantFilter -ErrorAction SilentlyContinue
+
+            # Build lookup tables: CA policies use templateId, assignments use definitionId
+            $TemplateToDefinitionId = @{}
+            $RoleNameLookup = @{}
+            foreach ($rd in $roleDefinitions) {
+                if ($null -ne $rd.templateId) {
+                    $TemplateToDefinitionId[$rd.templateId] = $rd.id
+                    $RoleNameLookup[$rd.templateId] = $rd.displayName
+                }
+            }
 
             foreach ($Policy in $CAPolicies) {
                 # Only include policies that require MFA
@@ -76,7 +97,7 @@ function Get-CIPPMFAState {
 
                 if ($RequiresMFA) {
                     # Handle user assignments
-                    if ($Policy.conditions.users.includeUsers -ne $null) {
+                    if ($null -ne $Policy.conditions.users.includeUsers) {
                         # Check if "All" is included
                         if ($Policy.conditions.users.includeUsers -contains 'All') {
                             $AllUserPolicies.Add($Policy)
@@ -90,17 +111,36 @@ function Get-CIPPMFAState {
                         }
                     }
 
+                    # Handle guest/external user assignments
+                    if ($null -ne $Policy.conditions.users.includeGuestsOrExternalUsers) {
+                        $GuestUserPolicies.Add($Policy)
+                    }
+
                     # Collect groups to resolve
-                    if ($Policy.conditions.users.includeGroups -ne $null -and $Policy.conditions.users.includeGroups.Count -gt 0) {
+                    if ($null -ne $Policy.conditions.users.includeGroups -and $Policy.conditions.users.includeGroups.Count -gt 0) {
                         foreach ($GroupId in $Policy.conditions.users.includeGroups) {
                             [void]$GroupsToResolve.Add($GroupId)
                         }
                     }
 
                     # Collect exclude groups to resolve
-                    if ($Policy.conditions.users.excludeGroups -ne $null -and $Policy.conditions.users.excludeGroups.Count -gt 0) {
+                    if ($null -ne $Policy.conditions.users.excludeGroups -and $Policy.conditions.users.excludeGroups.Count -gt 0) {
                         foreach ($GroupId in $Policy.conditions.users.excludeGroups) {
                             [void]$ExcludeGroupsToResolve.Add($GroupId)
+                        }
+                    }
+
+                    # Collect roles to resolve
+                    if ($null -ne $Policy.conditions.users.includeRoles -and $Policy.conditions.users.includeRoles.Count -gt 0) {
+                        foreach ($RoleId in $Policy.conditions.users.includeRoles) {
+                            [void]$RolesToResolve.Add($RoleId)
+                        }
+                    }
+
+                    # Collect exclude roles to resolve
+                    if ($null -ne $Policy.conditions.users.excludeRoles -and $Policy.conditions.users.excludeRoles.Count -gt 0) {
+                        foreach ($RoleId in $Policy.conditions.users.excludeRoles) {
+                            [void]$ExcludeRolesToResolve.Add($RoleId)
                         }
                     }
                 }
@@ -181,7 +221,7 @@ function Get-CIPPMFAState {
                 }
 
                 # Now add policies to users based on group membership
-                foreach ($Policy in $CAPolicies | Where-Object { $_.conditions.users.includeGroups -ne $null -and $_.conditions.users.includeGroups.Count -gt 0 }) {
+                foreach ($Policy in $CAPolicies | Where-Object { $null -ne $_.conditions.users.includeGroups -and $_.conditions.users.includeGroups.Count -gt 0 }) {
                     # Check if this policy requires MFA
                     $RequiresMFA = $false
                     if ($Policy.grantControls.builtInControls -contains 'mfa') {
@@ -212,6 +252,67 @@ function Get-CIPPMFAState {
                     }
                 }
             }
+
+            # Resolve role memberships from already-fetched $assignments
+            if ($RolesToResolve.Count -gt 0 -or $ExcludeRolesToResolve.Count -gt 0) {
+                $UserRoleMembership = @{}
+                $UserExcludeRoleMembership = @{}
+                $AllRoleTemplateIds = [System.Collections.Generic.HashSet[string]]::new()
+                foreach ($r in $RolesToResolve) { [void]$AllRoleTemplateIds.Add($r) }
+                foreach ($r in $ExcludeRolesToResolve) { [void]$AllRoleTemplateIds.Add($r) }
+
+                # Map each assignment's definitionId back to templateId
+                foreach ($assignment in $assignments) {
+                    if ($assignment.principal.'@odata.type' -ne '#microsoft.graph.user') { continue }
+                    $principalId = $assignment.principalId
+                    $defId = $assignment.roleDefinitionId
+
+                    foreach ($templateId in $AllRoleTemplateIds) {
+                        # Match: either the definition ID maps from this template, or for built-in roles they're equal
+                        $matchedDefId = $TemplateToDefinitionId[$templateId]
+                        if ($defId -eq $matchedDefId -or $defId -eq $templateId) {
+                            if ($RolesToResolve.Contains($templateId)) {
+                                if (-not $UserRoleMembership.ContainsKey($principalId)) {
+                                    $UserRoleMembership[$principalId] = [System.Collections.Generic.HashSet[string]]::new()
+                                }
+                                [void]$UserRoleMembership[$principalId].Add($templateId)
+                            }
+                            if ($ExcludeRolesToResolve.Contains($templateId)) {
+                                if (-not $UserExcludeRoleMembership.ContainsKey($principalId)) {
+                                    $UserExcludeRoleMembership[$principalId] = [System.Collections.Generic.HashSet[string]]::new()
+                                }
+                                [void]$UserExcludeRoleMembership[$principalId].Add($templateId)
+                            }
+                        }
+                    }
+                }
+
+                # Add policies to users based on role membership (mirrors group pattern)
+                foreach ($Policy in $CAPolicies | Where-Object { $null -ne $_.conditions.users.includeRoles -and $_.conditions.users.includeRoles.Count -gt 0 }) {
+                    $RequiresMFA = $false
+                    if ($Policy.grantControls.builtInControls -contains 'mfa') { $RequiresMFA = $true }
+                    if ($Policy.grantControls.authenticationStrength.requirementsSatisfied -eq 'mfa') { $RequiresMFA = $true }
+
+                    if ($RequiresMFA) {
+                        foreach ($UserId in $UserRoleMembership.Keys) {
+                            $IsMember = $false
+                            foreach ($RoleId in $Policy.conditions.users.includeRoles) {
+                                if ($UserRoleMembership[$UserId].Contains($RoleId)) {
+                                    $IsMember = $true
+                                    break
+                                }
+                            }
+
+                            if ($IsMember) {
+                                if (-not $PolicyTable.ContainsKey($UserId)) {
+                                    $PolicyTable[$UserId] = [System.Collections.Generic.List[object]]::new()
+                                }
+                                $PolicyTable[$UserId].Add($Policy)
+                            }
+                        }
+                    }
+                }
+            }
         } catch {
             $CASuccess = $false
             $CAError = "CA policies not available: $($_.Exception.Message)"
@@ -221,37 +322,135 @@ function Get-CIPPMFAState {
 
     if ($CAState.count -eq 0) { $CAState.Add('None') | Out-Null }
 
-    $assignments = New-GraphGetRequest -uri "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?`$expand=principal" -tenantid $TenantFilter -ErrorAction SilentlyContinue
+    # Fetch role assignments if not already fetched (e.g., when MFA registration was unavailable)
+    if ($null -eq $assignments) {
+        $assignments = New-GraphGetRequest -uri "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?`$expand=principal" -tenantid $TenantFilter -ErrorAction SilentlyContinue
+    }
 
-    $adminObjectIds = $assignments |
-        Where-Object {
-            $_.principal.'@odata.type' -eq '#microsoft.graph.user'
-        } |
-        ForEach-Object {
-            $_.principal.id
-        }
+    $adminObjectIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($Assignment in $assignments) {
+        if ($Assignment.principal.'@odata.type' -eq '#microsoft.graph.user') { [void]$adminObjectIds.Add([string]$Assignment.principal.id) }
+    }
 
-    # Interact with query parameters or the body of the request.
-    $GraphRequest = $Users | ForEach-Object {
+    # Rows are emitted as they are built so a streaming caller never holds the whole tenant.
+    foreach ($User in $Users) {
         $UserCAState = [System.Collections.Generic.List[object]]::new()
 
+        # Check if user is a guest and add guest-targeting policies
+        if ($User.UserType -eq 'Guest') {
+            foreach ($Policy in $GuestUserPolicies) {
+                $GuestConfig = $Policy.conditions.users.includeGuestsOrExternalUsers
+                $IsGuestIncluded = $false
+
+                if ($null -ne $GuestConfig -and $null -ne $GuestConfig.guestOrExternalUserTypes) {
+                    $GuestTypes = $GuestConfig.guestOrExternalUserTypes -split ','
+                    # Check if policy includes all guests or specifically internal guests
+                    if ($GuestTypes -contains 'internalGuest') {
+                        $IsGuestIncluded = $true
+                    }
+                }
+
+                # Check if guests are explicitly excluded from the policy
+                $ExcludeGuestConfig = $Policy.conditions.users.excludeGuestsOrExternalUsers
+                if ($null -ne $ExcludeGuestConfig -and $null -ne $ExcludeGuestConfig.guestOrExternalUserTypes) {
+                    $ExcludeGuestTypes = $ExcludeGuestConfig.guestOrExternalUserTypes -split ','
+                    if ($ExcludeGuestTypes -contains 'internalGuest') {
+                        $IsGuestIncluded = $false
+                    }
+                }
+
+                if ($IsGuestIncluded) {
+                    # Check if user is excluded directly or via group/role
+                    $IsExcluded = $Policy.conditions.users.excludeUsers -contains $User.ObjectId
+                    $ExcludedViaGroup = $null
+                    $ExcludedViaRole = $null
+
+                    # Check exclude groups
+                    if (-not $IsExcluded -and $null -ne $Policy.conditions.users.excludeGroups -and $Policy.conditions.users.excludeGroups.Count -gt 0) {
+                        if ($UserExcludeGroupMembership.ContainsKey($User.ObjectId)) {
+                            foreach ($ExcludeGroupId in $Policy.conditions.users.excludeGroups) {
+                                if ($UserExcludeGroupMembership[$User.ObjectId].Contains($ExcludeGroupId)) {
+                                    $IsExcluded = $true
+                                    $ExcludedViaGroup = if ($GroupNameLookup.ContainsKey($ExcludeGroupId)) {
+                                        $GroupNameLookup[$ExcludeGroupId]
+                                    } else {
+                                        $ExcludeGroupId
+                                    }
+                                    break
+                                }
+                            }
+                        }
+                    }
+
+                    # Check exclude roles
+                    if (-not $IsExcluded -and $null -ne $Policy.conditions.users.excludeRoles -and $Policy.conditions.users.excludeRoles.Count -gt 0) {
+                        if ($UserExcludeRoleMembership.ContainsKey($User.ObjectId)) {
+                            foreach ($ExcludeRoleId in $Policy.conditions.users.excludeRoles) {
+                                if ($UserExcludeRoleMembership[$User.ObjectId].Contains($ExcludeRoleId)) {
+                                    $IsExcluded = $true
+                                    $ExcludedViaRole = if ($RoleNameLookup.ContainsKey($ExcludeRoleId)) {
+                                        $RoleNameLookup[$ExcludeRoleId]
+                                    } else {
+                                        $ExcludeRoleId
+                                    }
+                                    break
+                                }
+                            }
+                        }
+                    }
+
+                    $PolicyObj = [PSCustomObject]@{
+                        DisplayName  = $Policy.displayName
+                        UserIncluded = -not $IsExcluded
+                        AllApps      = ($Policy.conditions.applications.includeApplications -contains 'All')
+                        PolicyState  = $Policy.state
+                    }
+                    if ($ExcludedViaGroup) {
+                        $PolicyObj | Add-Member -NotePropertyName 'ExcludedViaGroup' -NotePropertyValue $ExcludedViaGroup
+                    }
+                    if ($ExcludedViaRole) {
+                        $PolicyObj | Add-Member -NotePropertyName 'ExcludedViaRole' -NotePropertyValue $ExcludedViaRole
+                    }
+                    $UserCAState.Add($PolicyObj)
+                }
+            }
+        }
+
         # Add policies that apply to this specific user
-        if ($PolicyTable.ContainsKey($_.ObjectId)) {
-            foreach ($Policy in $PolicyTable[$_.ObjectId]) {
-                # Check if user is excluded directly or via group
-                $IsExcluded = $Policy.conditions.users.excludeUsers -contains $_.ObjectId
+        if ($PolicyTable.ContainsKey($User.ObjectId)) {
+            foreach ($Policy in $PolicyTable[$User.ObjectId]) {
+                # Check if user is excluded directly or via group/role
+                $IsExcluded = $Policy.conditions.users.excludeUsers -contains $User.ObjectId
                 $ExcludedViaGroup = $null
+                $ExcludedViaRole = $null
 
                 # Check exclude groups
-                if (-not $IsExcluded -and $Policy.conditions.users.excludeGroups -ne $null -and $Policy.conditions.users.excludeGroups.Count -gt 0) {
-                    if ($UserExcludeGroupMembership.ContainsKey($_.ObjectId)) {
+                if (-not $IsExcluded -and $null -ne $Policy.conditions.users.excludeGroups -and $Policy.conditions.users.excludeGroups.Count -gt 0) {
+                    if ($UserExcludeGroupMembership.ContainsKey($User.ObjectId)) {
                         foreach ($ExcludeGroupId in $Policy.conditions.users.excludeGroups) {
-                            if ($UserExcludeGroupMembership[$_.ObjectId].Contains($ExcludeGroupId)) {
+                            if ($UserExcludeGroupMembership[$User.ObjectId].Contains($ExcludeGroupId)) {
                                 $IsExcluded = $true
                                 $ExcludedViaGroup = if ($GroupNameLookup.ContainsKey($ExcludeGroupId)) {
                                     $GroupNameLookup[$ExcludeGroupId]
                                 } else {
                                     $ExcludeGroupId
+                                }
+                                break
+                            }
+                        }
+                    }
+                }
+
+                # Check exclude roles
+                if (-not $IsExcluded -and $null -ne $Policy.conditions.users.excludeRoles -and $Policy.conditions.users.excludeRoles.Count -gt 0) {
+                    if ($UserExcludeRoleMembership.ContainsKey($User.ObjectId)) {
+                        foreach ($ExcludeRoleId in $Policy.conditions.users.excludeRoles) {
+                            if ($UserExcludeRoleMembership[$User.ObjectId].Contains($ExcludeRoleId)) {
+                                $IsExcluded = $true
+                                $ExcludedViaRole = if ($RoleNameLookup.ContainsKey($ExcludeRoleId)) {
+                                    $RoleNameLookup[$ExcludeRoleId]
+                                } else {
+                                    $ExcludeRoleId
                                 }
                                 break
                             }
@@ -268,26 +467,58 @@ function Get-CIPPMFAState {
                 if ($ExcludedViaGroup) {
                     $PolicyObj | Add-Member -NotePropertyName 'ExcludedViaGroup' -NotePropertyValue $ExcludedViaGroup
                 }
+                if ($ExcludedViaRole) {
+                    $PolicyObj | Add-Member -NotePropertyName 'ExcludedViaRole' -NotePropertyValue $ExcludedViaRole
+                }
                 $UserCAState.Add($PolicyObj)
             }
         }
 
         # Add policies that apply to all users
         foreach ($Policy in $AllUserPolicies) {
-            # Check if user is excluded directly or via group
-            $IsExcluded = $Policy.conditions.users.excludeUsers -contains $_.ObjectId
+            # Check if user is excluded directly or via group/role
+            $IsExcluded = $Policy.conditions.users.excludeUsers -contains $User.ObjectId
             $ExcludedViaGroup = $null
+            $ExcludedViaRole = $null
+
+            # Check if guests are excluded from this "All users" policy
+            if (-not $IsExcluded -and $User.UserType -eq 'Guest') {
+                $ExcludeGuestConfig = $Policy.conditions.users.excludeGuestsOrExternalUsers
+                if ($null -ne $ExcludeGuestConfig -and $null -ne $ExcludeGuestConfig.guestOrExternalUserTypes) {
+                    $ExcludeGuestTypes = $ExcludeGuestConfig.guestOrExternalUserTypes -split ','
+                    if ($ExcludeGuestTypes -contains 'internalGuest') {
+                        $IsExcluded = $true
+                    }
+                }
+            }
 
             # Check exclude groups
-            if (-not $IsExcluded -and $Policy.conditions.users.excludeGroups -ne $null -and $Policy.conditions.users.excludeGroups.Count -gt 0) {
-                if ($UserExcludeGroupMembership.ContainsKey($_.ObjectId)) {
+            if (-not $IsExcluded -and $null -ne $Policy.conditions.users.excludeGroups -and $Policy.conditions.users.excludeGroups.Count -gt 0) {
+                if ($UserExcludeGroupMembership.ContainsKey($User.ObjectId)) {
                     foreach ($ExcludeGroupId in $Policy.conditions.users.excludeGroups) {
-                        if ($UserExcludeGroupMembership[$_.ObjectId].Contains($ExcludeGroupId)) {
+                        if ($UserExcludeGroupMembership[$User.ObjectId].Contains($ExcludeGroupId)) {
                             $IsExcluded = $true
                             $ExcludedViaGroup = if ($GroupNameLookup.ContainsKey($ExcludeGroupId)) {
                                 $GroupNameLookup[$ExcludeGroupId]
                             } else {
                                 $ExcludeGroupId
+                            }
+                            break
+                        }
+                    }
+                }
+            }
+
+            # Check exclude roles
+            if (-not $IsExcluded -and $null -ne $Policy.conditions.users.excludeRoles -and $Policy.conditions.users.excludeRoles.Count -gt 0) {
+                if ($UserExcludeRoleMembership.ContainsKey($User.ObjectId)) {
+                    foreach ($ExcludeRoleId in $Policy.conditions.users.excludeRoles) {
+                        if ($UserExcludeRoleMembership[$User.ObjectId].Contains($ExcludeRoleId)) {
+                            $IsExcluded = $true
+                            $ExcludedViaRole = if ($RoleNameLookup.ContainsKey($ExcludeRoleId)) {
+                                $RoleNameLookup[$ExcludeRoleId]
+                            } else {
+                                $ExcludeRoleId
                             }
                             break
                         }
@@ -305,38 +536,47 @@ function Get-CIPPMFAState {
             if ($ExcludedViaGroup) {
                 $PolicyObj | Add-Member -NotePropertyName 'ExcludedViaGroup' -NotePropertyValue $ExcludedViaGroup
             }
+            if ($ExcludedViaRole) {
+                $PolicyObj | Add-Member -NotePropertyName 'ExcludedViaRole' -NotePropertyValue $ExcludedViaRole
+            }
             $UserCAState.Add($PolicyObj)
         }
 
-        # Determine if user is covered by CA
-        if ($UserCAState.Count -gt 0 -and ($UserCAState | Where-Object { $_.UserIncluded -eq $true -and $_.PolicyState -eq 'enabled' })) {
-            $EnabledPolicies = $UserCAState | Where-Object { $_.UserIncluded -eq $true -and $_.PolicyState -eq 'enabled' }
-            if ($EnabledPolicies | Where-Object { $_.AllApps -eq $true }) {
-                $CoveredByCA = 'Enforced - All Apps'
-            } else {
-                $CoveredByCA = 'Enforced - Specific Apps'
-            }
-        } else {
-            if ($CASuccess -eq $false) {
-                $CoveredByCA = $CAError
-            } else {
-                $CoveredByCA = 'Not Enforced'
+        # Determine if user is covered by CA. This is a single pass on purpose: it used to
+        # run three Where-Object pipelines per user, which on a 60k user tenant was tens of
+        # seconds of pipeline setup on its own.
+        $HasEnabledPolicy = $false
+        $HasAllAppsPolicy = $false
+        foreach ($Policy in $UserCAState) {
+            if ($Policy.UserIncluded -eq $true -and $Policy.PolicyState -eq 'enabled') {
+                $HasEnabledPolicy = $true
+                if ($Policy.AllApps -eq $true) {
+                    $HasAllAppsPolicy = $true
+                    break
+                }
             }
         }
-        $IsAdmin = if ($adminObjectIds -contains $_.ObjectId) { $true } else { $false }
+        if ($HasEnabledPolicy) {
+            $CoveredByCA = if ($HasAllAppsPolicy) { 'Enforced - All Apps' } else { 'Enforced - Specific Apps' }
+        } elseif ($CASuccess -eq $false) {
+            $CoveredByCA = $CAError
+        } else {
+            $CoveredByCA = 'Not Enforced'
+        }
+        $IsAdmin = $adminObjectIds.Contains([string]$User.ObjectId)
 
-        $PerUser = $_.PerUserMFAState
+        $PerUser = $User.PerUserMFAState
 
-        $MFARegUser = $MFAIndex[$_.UserPrincipalName]
+        $MFARegUser = $MFAIndex[$User.UserPrincipalName]
 
         [PSCustomObject]@{
             Tenant          = $TenantFilter
-            ID              = $_.ObjectId
-            UPN             = $_.UserPrincipalName
-            DisplayName     = $_.DisplayName
-            AccountEnabled  = $_.accountEnabled
+            ID              = $User.ObjectId
+            UPN             = $User.UserPrincipalName
+            DisplayName     = $User.DisplayName
+            AccountEnabled  = $User.accountEnabled
             PerUser         = $PerUser
-            isLicensed      = $_.isLicensed
+            isLicensed      = $User.isLicensed
             MFARegistration = if ($null -ne $MFARegUser) { [bool]$MFARegUser.isMfaRegistered } else { $null }
             MFACapable      = if ($null -ne $MFARegUser) { [bool]$MFARegUser.isMfaCapable } else { $null }
             MFAMethods      = if ($null -ne $MFARegUser) { @($MFARegUser.methodsRegistered) } else { @() }
@@ -344,7 +584,8 @@ function Get-CIPPMFAState {
             CAPolicies      = @($UserCAState)
             CoveredBySD     = $SecureDefaultsState
             IsAdmin         = $IsAdmin
-            RowKey          = [string]($_.UserPrincipalName).replace('#', '')
+            UserType        = $User.UserType
+            RowKey          = [string]($User.UserPrincipalName).replace('#', '')
             PartitionKey    = 'users'
         }
     }
@@ -357,5 +598,4 @@ function Get-CIPPMFAState {
         }
         Write-LogMessage -headers $Headers -API $APIName -Tenant $TenantFilter -message "The MFA report encountered $Text, see log data for details." -Sev 'Error' -LogData @($Errors.Message)
     }
-    return $GraphRequest
 }

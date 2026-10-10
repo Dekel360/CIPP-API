@@ -4,7 +4,9 @@ function Get-CIPPLicenseOverview {
     param (
         $TenantFilter,
         $APIName = 'Get License Overview',
-        $Headers
+        $Headers,
+        [switch]$AlertMode,
+        [switch]$IncludeExcluded
     )
 
     $Requests = @(
@@ -37,9 +39,10 @@ function Get-CIPPLicenseOverview {
     )
 
     try {
-        $AdminPortalLicenses = New-GraphGetRequest -scope 'https://admin.microsoft.com/.default' -TenantID $TenantFilter -Uri 'https://admin.microsoft.com/admin/api/tenant/accountSkus'
+        $AdminPortalLicenses = New-GraphGetRequest -scope 'https://admin.microsoft.com/.default' -TenantID $TenantFilter -Uri 'https://admin.microsoft.com/fd/m365licensing/v3/licensedProducts?allotmentSourceOwnerType=User&allotmentSourceType=LowFrictionTrial&allotmentSourceState=Active,Deleted,Suspended,Lockout,Warning&displayNameLanguage=en-GB'
     } catch {
-        Write-Warning 'Failed to get Admin Portal Licenses'
+        Write-Warning "Failed to get Admin Portal Licenses: $($_.Exception.Message)"
+        $AdminPortalLicenses = @()
     }
 
     $Results = New-GraphBulkRequest -Requests $Requests -TenantID $TenantFilter -asapp $true
@@ -50,12 +53,31 @@ function Get-CIPPLicenseOverview {
         Tenant   = $TenantFilter
         Licenses = $LicRequest
     }
-    $ModuleBase = Get-Module -Name CIPPCore | Select-Object -ExpandProperty ModuleBase
-    $ConvertTable = Import-Csv (Join-Path $ModuleBase 'lib\data\ConversionTable.csv')
+    # GUID -> display name, last row wins
+    $SkuNames = @{}
+    foreach ($Row in [System.IO.File]::ReadAllText((Join-Path $env:CIPPRootPath 'Config\ConversionTable.csv')) | ConvertFrom-Csv) { $SkuNames[$Row.GUID] = $Row.Product_Display_Name }
     $LicenseTable = Get-CIPPTable -TableName ExcludedLicenses
     $ExcludedSkuList = Get-CIPPAzDataTableEntity @LicenseTable
 
-    $AllLicensedUsers = @(($Results | Where-Object { $_.id -eq 'licensedUsers' }).body.value)
+    # If no excluded licenses exist, initialize them
+    if ($ExcludedSkuList.Count -lt 1) {
+        Write-Information 'Excluded licenses table is empty. Initializing from config file.'
+        $null = Initialize-CIPPExcludedLicenses
+        $ExcludedSkuList = Get-CIPPAzDataTableEntity @LicenseTable
+    }
+
+    # In AlertMode, exclude all licenses in the table (both ExcludedEverywhere and alert-only)
+    # In normal mode, only exclude licenses where ExcludedEverywhere is true (or null for backward compat)
+    if ($AlertMode) {
+        $EffectiveExcludedGuids = @($ExcludedSkuList.GUID)
+    } else {
+        $EffectiveExcludedGuids = @($ExcludedSkuList | Where-Object {
+            $null -eq $_.ExcludedEverywhere -or $_.ExcludedEverywhere -eq $true
+        } | ForEach-Object { $_.GUID })
+    }
+    $HiddenFromDropdownGuids = @($ExcludedSkuList | Where-Object { $_.ShowInLicenseDropdown -eq $false } | ForEach-Object { $_.GUID })
+
+    $AllLicensedUsers = @(($Results | Where-Object { $_.id -eq 'licensedUsers' }).body.value) | Sort-Object -Property displayName
     $UsersBySku = @{}
     foreach ($User in $AllLicensedUsers) {
         if (-not $User.assignedLicenses) { continue } # Skip users with no assigned licenses. Should not happens as the filter is applied, but just in case
@@ -76,7 +98,7 @@ function Get-CIPPLicenseOverview {
 
     }
 
-    $AllLicensedGroups = @(($Results | Where-Object { $_.id -eq 'licensedGroups' }).body.value)
+    $AllLicensedGroups = @(($Results | Where-Object { $_.id -eq 'licensedGroups' }).body.value) | Sort-Object -Property displayName
     $GroupsBySku = @{}
     foreach ($Group in $AllLicensedGroups) {
         if (-not $Group.assignedLicenses) { continue }
@@ -102,9 +124,11 @@ function Get-CIPPLicenseOverview {
     $GraphRequest = foreach ($singleReq in $RawGraphRequest) {
         $skuId = $singleReq.Licenses
         foreach ($sku in $skuId) {
-            if ($sku.skuId -in $ExcludedSkuList.GUID) { continue }
-            $PrettyNameAdmin = $AdminPortalLicenses | Where-Object { $_.SkuId -eq $sku.skuId } | Select-Object -ExpandProperty Name
-            $PrettyNameCSV = ($ConvertTable | Where-Object { $_.guid -eq $sku.skuid }).'Product_Display_Name' | Select-Object -Last 1
+            if ($sku.skuId -in $EffectiveExcludedGuids) {
+                if (!$IncludeExcluded -or $sku.skuId -in $HiddenFromDropdownGuids) { continue }
+            }
+            $PrettyNameAdmin = $AdminPortalLicenses | Where-Object { $_.aadSkuId -eq $sku.skuId } | Select-Object -ExpandProperty displayName -First 1
+            $PrettyNameCSV = $SkuNames[[string]$sku.skuid]
             $PrettyName = $PrettyNameAdmin ?? $PrettyNameCSV ?? $sku.skuPartNumber
 
             # Initialize $Term with the default value
@@ -112,7 +136,9 @@ function Get-CIPPLicenseOverview {
                 $SubInfo = $SkuIDs | Where-Object { $_.id -eq $Subscription }
                 $diff = $SubInfo.nextLifecycleDateTime - $SubInfo.createdDateTime
                 $Term = 'Term unknown or non-NCE license'
-                if ($diff.Days -ge 360 -and $diff.Days -le 1089) {
+                if ($SubInfo.isTrial) {
+                    $Term = 'Trial'
+                } elseif ($diff.Days -ge 36 -and $diff.Days -le 1089) {
                     $Term = 'Yearly'
                 } elseif ($diff.Days -ge 1090 -and $diff.Days -le 1100) {
                     $Term = '3 Year'
@@ -126,6 +152,7 @@ function Get-CIPPLicenseOverview {
                     TotalLicenses     = $SubInfo.totalLicenses
                     DaysUntilRenew    = $TimeUntilRenew
                     NextLifecycle     = $SubInfo.nextLifecycleDateTime
+                    CreatedDateTime   = $SubInfo.createdDateTime
                     IsTrial           = $SubInfo.isTrial
                     SubscriptionId    = $subinfo.id
                     CSPSubscriptionId = $SubInfo.commerceSubscriptionId
@@ -142,11 +169,12 @@ function Get-CIPPLicenseOverview {
                 skuId          = [string]$sku.skuId
                 skuPartNumber  = [string]$PrettyName
                 availableUnits = [string]$sku.prepaidUnits.enabled - $sku.consumedUnits
-                TermInfo       = $TermInfo
+                TermInfo       = @($TermInfo)
                 AssignedUsers  = ($UsersBySku.ContainsKey($SkuKey) ? @(($UsersBySku[$SkuKey])) : $null)
                 AssignedGroups = ($GroupsBySku.ContainsKey($SkuKey) ? @(($GroupsBySku[$SkuKey])) : $null)
+                ServicePlans   = $sku.servicePlans
             }
         }
     }
-    return $GraphRequest
+    return ($GraphRequest | Sort-Object -Property License)
 }

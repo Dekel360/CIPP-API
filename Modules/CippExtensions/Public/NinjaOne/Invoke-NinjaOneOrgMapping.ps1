@@ -96,6 +96,7 @@ function Invoke-NinjaOneOrgMapping {
     $Batch = Foreach ($Tenant in $Tenants | Where-Object { $_.customerId -notin $MatchedM365Tenants.customerId }) {
         [PSCustomObject]@{
             'NinjaAction'  = 'AutoMapTenant'
+            'TenantFilter' = $Tenant.defaultDomainName
             'M365Tenant'   = $Tenant
             'NinjaOrgs'    = $NinjaOrgs | Where-Object { $_.id -notin $MatchedNinjaOrgs }
             'NinjaDevices' = $ParsedNinjaDevices
@@ -108,7 +109,7 @@ function Invoke-NinjaOneOrgMapping {
             Batch            = @($Batch)
         }
         #Write-Host ($InputObject | ConvertTo-Json)
-        $InstanceId = Start-NewOrchestration -FunctionName 'CIPPOrchestrator' -InputObject ($InputObject | ConvertTo-Json -Depth 5 -Compress)
+        $InstanceId = Start-CIPPOrchestrator -InputObject $InputObject
         Write-Host "Started permissions orchestration with ID = '$InstanceId'"
     }
 }
